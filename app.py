@@ -485,267 +485,371 @@ col1, col2 = st.columns([1, 3])
 
 with col1:
     st.header("Input State")
-    # Mode selector: Single State Point, Process, or Air Mixing
-    mode = st.radio("Mode:", ["Single State Point", "Process", "Air Mixing"], index=0)
+    # Mode selector: Single State Point, Process, Air Mixing, or Cycle Analysis
+    mode = st.radio("Mode:", ["Single State Point", "Process", "Air Mixing", "Cycle Analysis"], index=0)
     
     if mode == "Process":
         st.markdown("**Point 1:** Select **exactly two** of the four state inputs:")
     elif mode == "Air Mixing":
         st.markdown("**Point 1:** Select **exactly two** of the four state inputs:")
+    elif mode == "Cycle Analysis":
+        # --- Cycle Analysis (AHU Builder) ---
+        if "cycle_points" not in st.session_state:
+            st.session_state["cycle_points"] = []
+        if "cycle_total_airflow" not in st.session_state:
+            st.session_state["cycle_total_airflow"] = 10000.0
+        if "cycle_pct_oa" not in st.session_state:
+            st.session_state["cycle_pct_oa"] = 20.0
+        if "cycle_ra_db" not in st.session_state:
+            st.session_state["cycle_ra_db"] = 75.0 if not USE_SI else 24.0
+        if "cycle_ra_rh" not in st.session_state:
+            st.session_state["cycle_ra_rh"] = 50.0
+        if "cycle_oa_db" not in st.session_state:
+            st.session_state["cycle_oa_db"] = 95.0 if not USE_SI else 35.0
+        if "cycle_oa_rh" not in st.session_state:
+            st.session_state["cycle_oa_rh"] = 40.0
+
+        st.markdown("**Mixing Box**")
+        if USE_SI:
+            total_airflow = st.number_input("Total System Airflow (m³/hr)", value=int(st.session_state.get("cycle_total_airflow", 5000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
+        else:
+            total_airflow = st.number_input("Total System Airflow (CFM)", value=int(st.session_state.get("cycle_total_airflow", 10000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
+        pct_oa = st.slider("% Outside Air", 0, 100, int(st.session_state.get("cycle_pct_oa", 20)), key="cycle_pct_oa")
+        st.markdown("**Return Air (RA)**")
+        ra_db = st.number_input("RA Dry Bulb (" + (TEMP_LABEL + ")"), value=float(st.session_state.get("cycle_ra_db", 75.0 if not USE_SI else 24.0)), step=0.5, key="cycle_ra_db")
+        ra_rh = st.number_input("RA Relative Humidity (%)", value=float(st.session_state.get("cycle_ra_rh", 50.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_ra_rh")
+        st.markdown("**Outside Air (OA)**")
+        oa_db = st.number_input("OA Dry Bulb (" + (TEMP_LABEL + ")"), value=float(st.session_state.get("cycle_oa_db", 95.0 if not USE_SI else 35.0)), step=0.5, key="cycle_oa_db")
+        oa_rh = st.number_input("OA Relative Humidity (%)", value=float(st.session_state.get("cycle_oa_rh", 40.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_oa_rh")
+
+        t_min_solve = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
+        t_max_solve = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+        results_ra = None
+        results_oa = None
+        results_ma = None
+        try:
+            results_ra = solve_state_from_two(db=ra_db, rh=ra_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+            results_oa = solve_state_from_two(db=oa_db, rh=oa_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+        except Exception as e:
+            st.error(f"RA or OA state invalid: {e}")
+        if results_ra is not None and results_oa is not None:
+            if pct_oa >= 99.5:
+                results_ma = results_oa
+                st.success("100% Outside Air - no mixing")
+                st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+            elif pct_oa <= 0.5:
+                results_ma = results_ra
+                st.success("100% Return Air - no mixing")
+                st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+            else:
+                airflow_oa = total_airflow * (pct_oa / 100.0)
+                airflow_ra = total_airflow * (1.0 - pct_oa / 100.0)
+                if USE_SI:
+                    mass_oa = airflow_oa * results_oa[KEY_DENS] / 3600.0
+                    mass_ra = airflow_ra * results_ra[KEY_DENS] / 3600.0
+                else:
+                    mass_oa = airflow_oa * results_oa[KEY_DENS]
+                    mass_ra = airflow_ra * results_ra[KEY_DENS]
+                tot_mass = mass_oa + mass_ra
+                if tot_mass > 0:
+                    h_mix = (mass_oa * results_oa[KEY_ENTH] + mass_ra * results_ra[KEY_ENTH]) / tot_mass
+                    w_mix = (mass_oa * results_oa[KEY_HR] + mass_ra * results_ra[KEY_HR]) / tot_mass
+                    try:
+                        results_ma = solve_state_from_enthalpy_humratio(h_mix, w_mix, PRESSURE, t_min_solve, t_max_solve)
+                    except Exception:
+                        results_ma = None
+                if results_ma is not None:
+                    st.success("Mixed Air Result")
+                    st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+
+        st.divider()
+        st.markdown("**Process Chain**")
+        cycle_points = st.session_state.get("cycle_points", [])
+        if len(cycle_points) < 3:
+            st.markdown("Add next component (leaving state):")
+            st.caption("Enter DB and RH for the leaving air state.")
+            c_db = st.number_input("DB (" + TEMP_LABEL + ")", value=55.0 if not USE_SI else 13.0, step=0.5, key="cycle_new_db")
+            c_rh = st.number_input("RH (%)", value=90.0, step=0.5, min_value=0.0, max_value=100.0, key="cycle_new_rh")
+            c_name = st.text_input("Point name (e.g. Cooling Coil Leaving)", value="", key="cycle_new_name", placeholder="e.g. Coil Leaving")
+            if st.button("Add Point", key="cycle_add_btn"):
+                try:
+                    pt_state = solve_state_from_two(db=c_db, rh=c_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+                    name = c_name.strip() or f"Point {len(cycle_points)+1}"
+                    cycle_points = st.session_state.get("cycle_points", []) + [{"name": name, "state": pt_state}]
+                    st.session_state["cycle_points"] = cycle_points[:3]
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Invalid state: {ex}. Select exactly two of DB/RH/WB/DP.")
+        for i, pt in enumerate(cycle_points):
+            cols = st.columns([1, 0.15])
+            with cols[0]:
+                st.caption(f"{pt['name']}: DB={pt['state'][KEY_DB]:.1f}, WB={pt['state'][KEY_WB]:.1f}")
+            with cols[1]:
+                if st.button("X", key=f"cycle_del_{i}"):
+                    cycle_points = st.session_state.get("cycle_points", [])
+                    cycle_points.pop(i)
+                    st.session_state["cycle_points"] = cycle_points
+                    st.rerun()
+        results_1 = None
+        results_2 = None
+        st.session_state["cycle_ra"] = results_ra
+        st.session_state["cycle_oa"] = results_oa
+        st.session_state["cycle_ma"] = results_ma
     else:
         st.markdown("Select **exactly two** of the four state inputs:")
 
-    # Temperature inputs with unit conversion on system change
-    # Get stored values or defaults
-    db_stored = st.session_state.get("db_input_1", None)
-    wb_stored = st.session_state.get("wb_input_1", None)
-    dp_stored = st.session_state.get("dp_input_1", None)
-    
-    # Convert if unit system changed and update session state
-    if unit_system_changed and db_stored is not None:
-        if USE_SI:  # Switching to SI: convert °F to °C
-            st.session_state["db_input_1"] = f_to_c(db_stored)
-            db_stored = st.session_state["db_input_1"]
-            if wb_stored is not None:
-                st.session_state["wb_input_1"] = f_to_c(wb_stored)
-                wb_stored = st.session_state["wb_input_1"]
-            if dp_stored is not None:
-                st.session_state["dp_input_1"] = f_to_c(dp_stored)
-                dp_stored = st.session_state["dp_input_1"]
-        else:  # Switching to IP: convert °C to °F
-            st.session_state["db_input_1"] = c_to_f(db_stored)
-            db_stored = st.session_state["db_input_1"]
-            if wb_stored is not None:
-                st.session_state["wb_input_1"] = c_to_f(wb_stored)
-                wb_stored = st.session_state["wb_input_1"]
-            if dp_stored is not None:
-                st.session_state["dp_input_1"] = c_to_f(dp_stored)
-                dp_stored = st.session_state["dp_input_1"]
-    
-    # Dry Bulb
-    db_default = 24.0 if USE_SI else 75.0
-    db_value = db_stored if db_stored is not None else db_default
-    db_sel_col, db_input_col = st.columns([0.25, 0.75])
-    use_db = db_sel_col.checkbox("DB", value=True)
-    db_input = db_input_col.number_input(f"Dry Bulb Temp ({TEMP_LABEL})", value=db_value, step=0.5, key="db_input_1")
-
-    # Relative Humidity (no conversion needed)
-    rh_sel_col, rh_input_col = st.columns([0.25, 0.75])
-    use_rh = rh_sel_col.checkbox("RH", value=True)
-    rh_input = rh_input_col.number_input(
-        "Relative Humidity (%)", value=st.session_state.get("rh_input_1", 50.0), step=0.5, min_value=0.0, max_value=100.0, key="rh_input_1"
-    )
-
-    # Wet Bulb
-    wb_default = 18.0 if USE_SI else 65.0
-    wb_value = wb_stored if wb_stored is not None else wb_default
-    wb_sel_col, wb_input_col = st.columns([0.25, 0.75])
-    use_wb = wb_sel_col.checkbox("WB", value=False)
-    wb_input = wb_input_col.number_input(f"Wet Bulb Temp ({TEMP_LABEL})", value=wb_value, step=0.5, key="wb_input_1")
-
-    # Dew Point
-    dp_default = 13.0 if USE_SI else 55.0
-    dp_value = dp_stored if dp_stored is not None else dp_default
-    dp_sel_col, dp_input_col = st.columns([0.25, 0.75])
-    use_dp = dp_sel_col.checkbox("DP", value=False)
-    dp_input = dp_input_col.number_input(f"Dew Point Temp ({TEMP_LABEL})", value=dp_value, step=0.5, key="dp_input_1")
-
-    # Airflow Input for Point 1
-    st.markdown("**Airflow:**")
-    if USE_SI:
-        airflow_1 = st.number_input("Airflow (m³/hr)", value=1000, step=100, min_value=0, key="airflow_1", format="%d")
-        airflow_type_1 = None  # No radio needed for SI
-    else:
-        airflow_col, type_col = st.columns([0.7, 0.3])
-        with airflow_col:
-            airflow_1 = st.number_input("Airflow", value=1000, step=100, min_value=0, key="airflow_1", format="%d")
-        with type_col:
-            airflow_type_1 = st.radio("", ["ACFM", "SCFM"], index=0, key="airflow_type_1", horizontal=True, label_visibility="collapsed")
-    
-    # Display mass flow below airflow input (updated after Point 1 is solved)
-    mass_flow_1_display = st.session_state.get("mass_flow_1_display", None)
-    if mass_flow_1_display is not None:
-        if USE_SI:
-            st.caption(f":gray[Mass Flow: {mass_flow_1_display:.3f} kg/s]")
-        else:
-            st.caption(f":gray[Mass Flow: {mass_flow_1_display:.2f} lb/min]")
-
-    st.divider()
-
-    # Helper function to get inputs dict from checkboxes and inputs
-    def get_inputs_dict(use_db_val, db_val, use_rh_val, rh_val, use_wb_val, wb_val, use_dp_val, dp_val):
-        selected_keys = []
-        inputs = {}
-        if use_db_val:
-            selected_keys.append("db")
-            inputs["db"] = db_val
-        else:
-            inputs["db"] = None
-        if use_rh_val:
-            selected_keys.append("rh")
-            inputs["rh"] = rh_val
-        else:
-            inputs["rh"] = None
-        if use_wb_val:
-            selected_keys.append("wb")
-            inputs["wb"] = wb_val
-        else:
-            inputs["wb"] = None
-        if use_dp_val:
-            selected_keys.append("dp")
-            inputs["dp"] = dp_val
-        else:
-            inputs["dp"] = None
-        return selected_keys, inputs
-
-    # Point 1 inputs
-    selected_keys_1, inputs_1 = get_inputs_dict(use_db, db_input, use_rh, rh_input, use_wb, wb_input, use_dp, dp_input)
-
-    # Point 2 inputs (only in Process or Air Mixing mode)
-    if mode == "Process" or mode == "Air Mixing":
-        st.markdown("**Point 2:** Select **exactly two** of the four state inputs:")
-        
+    if mode != "Cycle Analysis":
         # Temperature inputs with unit conversion on system change
-        db_stored_2 = st.session_state.get("db_input2", None)
-        wb_stored_2 = st.session_state.get("wb_input2", None)
-        dp_stored_2 = st.session_state.get("dp_input2", None)
+        # Get stored values or defaults
+        db_stored = st.session_state.get("db_input_1", None)
+        wb_stored = st.session_state.get("wb_input_1", None)
+        dp_stored = st.session_state.get("dp_input_1", None)
         
         # Convert if unit system changed and update session state
-        if unit_system_changed and db_stored_2 is not None:
+        if unit_system_changed and db_stored is not None:
             if USE_SI:  # Switching to SI: convert °F to °C
-                st.session_state["db_input2"] = f_to_c(db_stored_2)
-                db_stored_2 = st.session_state["db_input2"]
-                if wb_stored_2 is not None:
-                    st.session_state["wb_input2"] = f_to_c(wb_stored_2)
-                    wb_stored_2 = st.session_state["wb_input2"]
-                if dp_stored_2 is not None:
-                    st.session_state["dp_input2"] = f_to_c(dp_stored_2)
-                    dp_stored_2 = st.session_state["dp_input2"]
+                st.session_state["db_input_1"] = f_to_c(db_stored)
+                db_stored = st.session_state["db_input_1"]
+                if wb_stored is not None:
+                    st.session_state["wb_input_1"] = f_to_c(wb_stored)
+                    wb_stored = st.session_state["wb_input_1"]
+                if dp_stored is not None:
+                    st.session_state["dp_input_1"] = f_to_c(dp_stored)
+                    dp_stored = st.session_state["dp_input_1"]
             else:  # Switching to IP: convert °C to °F
-                st.session_state["db_input2"] = c_to_f(db_stored_2)
-                db_stored_2 = st.session_state["db_input2"]
-                if wb_stored_2 is not None:
-                    st.session_state["wb_input2"] = c_to_f(wb_stored_2)
-                    wb_stored_2 = st.session_state["wb_input2"]
-                if dp_stored_2 is not None:
-                    st.session_state["dp_input2"] = c_to_f(dp_stored_2)
-                    dp_stored_2 = st.session_state["dp_input2"]
+                st.session_state["db_input_1"] = c_to_f(db_stored)
+                db_stored = st.session_state["db_input_1"]
+                if wb_stored is not None:
+                    st.session_state["wb_input_1"] = c_to_f(wb_stored)
+                    wb_stored = st.session_state["wb_input_1"]
+                if dp_stored is not None:
+                    st.session_state["dp_input_1"] = c_to_f(dp_stored)
+                    dp_stored = st.session_state["dp_input_1"]
         
-        # Point 2 inputs
-        db_default_2 = 29.0 if USE_SI else 85.0
-        db_value_2 = db_stored_2 if db_stored_2 is not None else db_default_2
-        db_sel_col_2, db_input_col_2 = st.columns([0.25, 0.75])
-        use_db_2 = db_sel_col_2.checkbox("DB", value=True, key="db2")
-        db_input_2 = db_input_col_2.number_input(f"Dry Bulb Temp ({TEMP_LABEL})", value=db_value_2, step=0.5, key="db_input2")
+        # Dry Bulb
+        db_default = 24.0 if USE_SI else 75.0
+        db_value = db_stored if db_stored is not None else db_default
+        db_sel_col, db_input_col = st.columns([0.25, 0.75])
+        use_db = db_sel_col.checkbox("DB", value=True)
+        db_input = db_input_col.number_input(f"Dry Bulb Temp ({TEMP_LABEL})", value=db_value, step=0.5, key="db_input_1")
 
-        rh_sel_col_2, rh_input_col_2 = st.columns([0.25, 0.75])
-        use_rh_2 = rh_sel_col_2.checkbox("RH", value=True, key="rh2")
-        rh_input_2 = rh_input_col_2.number_input(
-            "Relative Humidity (%)", value=st.session_state.get("rh_input2", 40.0), step=0.5, min_value=0.0, max_value=100.0, key="rh_input2"
+        # Relative Humidity (no conversion needed)
+        rh_sel_col, rh_input_col = st.columns([0.25, 0.75])
+        use_rh = rh_sel_col.checkbox("RH", value=True)
+        rh_input = rh_input_col.number_input(
+            "Relative Humidity (%)", value=st.session_state.get("rh_input_1", 50.0), step=0.5, min_value=0.0, max_value=100.0, key="rh_input_1"
         )
 
-        wb_default_2 = 21.0 if USE_SI else 70.0
-        wb_value_2 = wb_stored_2 if wb_stored_2 is not None else wb_default_2
-        wb_sel_col_2, wb_input_col_2 = st.columns([0.25, 0.75])
-        use_wb_2 = wb_sel_col_2.checkbox("WB", value=False, key="wb2")
-        wb_input_2 = wb_input_col_2.number_input(f"Wet Bulb Temp ({TEMP_LABEL})", value=wb_value_2, step=0.5, key="wb_input2")
+        # Wet Bulb
+        wb_default = 18.0 if USE_SI else 65.0
+        wb_value = wb_stored if wb_stored is not None else wb_default
+        wb_sel_col, wb_input_col = st.columns([0.25, 0.75])
+        use_wb = wb_sel_col.checkbox("WB", value=False)
+        wb_input = wb_input_col.number_input(f"Wet Bulb Temp ({TEMP_LABEL})", value=wb_value, step=0.5, key="wb_input_1")
 
-        dp_default_2 = 15.5 if USE_SI else 60.0
-        dp_value_2 = dp_stored_2 if dp_stored_2 is not None else dp_default_2
-        dp_sel_col_2, dp_input_col_2 = st.columns([0.25, 0.75])
-        use_dp_2 = dp_sel_col_2.checkbox("DP", value=False, key="dp2")
-        dp_input_2 = dp_input_col_2.number_input(f"Dew Point Temp ({TEMP_LABEL})", value=dp_value_2, step=0.5, key="dp_input2")
+        # Dew Point
+        dp_default = 13.0 if USE_SI else 55.0
+        dp_value = dp_stored if dp_stored is not None else dp_default
+        dp_sel_col, dp_input_col = st.columns([0.25, 0.75])
+        use_dp = dp_sel_col.checkbox("DP", value=False)
+        dp_input = dp_input_col.number_input(f"Dew Point Temp ({TEMP_LABEL})", value=dp_value, step=0.5, key="dp_input_1")
 
-        # Airflow Input for Point 2
+        # Airflow Input for Point 1
         st.markdown("**Airflow:**")
         if USE_SI:
-            airflow_2 = st.number_input("Airflow (m³/hr)", value=1000, step=100, min_value=0, key="airflow_2", format="%d")
-            airflow_type_2 = None
+            airflow_1 = st.number_input("Airflow (m³/hr)", value=1000, step=100, min_value=0, key="airflow_1", format="%d")
+            airflow_type_1 = None  # No radio needed for SI
         else:
-            airflow_col_2, type_col_2 = st.columns([0.7, 0.3])
-            with airflow_col_2:
-                airflow_2 = st.number_input("Airflow", value=1000, step=100, min_value=0, key="airflow_2", format="%d")
-            with type_col_2:
-                airflow_type_2 = st.radio("", ["ACFM", "SCFM"], index=0, key="airflow_type_2", horizontal=True, label_visibility="collapsed")
-        
-        # Display mass flow below airflow input (updated after Point 2 is solved)
-        mass_flow_2_display = st.session_state.get("mass_flow_2_display", None)
-        if mass_flow_2_display is not None:
+            airflow_col, type_col = st.columns([0.7, 0.3])
+            with airflow_col:
+                airflow_1 = st.number_input("Airflow", value=1000, step=100, min_value=0, key="airflow_1", format="%d")
+            with type_col:
+                airflow_type_1 = st.radio("", ["ACFM", "SCFM"], index=0, key="airflow_type_1", horizontal=True, label_visibility="collapsed")
+    
+        # Display mass flow below airflow input (updated after Point 1 is solved)
+        mass_flow_1_display = st.session_state.get("mass_flow_1_display", None)
+        if mass_flow_1_display is not None:
             if USE_SI:
-                st.caption(f":gray[Mass Flow: {mass_flow_2_display:.3f} kg/s]")
+                st.caption(f":gray[Mass Flow: {mass_flow_1_display:.3f} kg/s]")
             else:
-                st.caption(f":gray[Mass Flow: {mass_flow_2_display:.2f} lb/min]")
+                st.caption(f":gray[Mass Flow: {mass_flow_1_display:.2f} lb/min]")
 
         st.divider()
-        selected_keys_2, inputs_2 = get_inputs_dict(use_db_2, db_input_2, use_rh_2, rh_input_2, use_wb_2, wb_input_2, use_dp_2, dp_input_2)
-    else:
-        selected_keys_2, inputs_2 = None, None
-        airflow_2 = 0.0
-        airflow_type_2 = "ACFM"
-        mass_flow_2 = None
 
-    # Mass flow calculation helper
-    def calculate_mass_flow(airflow_val, airflow_type, results_dict=None):
-        """Calculate mass flow rate from airflow.
-        Returns mass flow in lb/min (IP) or kg/s (SI)"""
-        if results_dict is None or KEY_DENS not in results_dict:
-            return None
-        if USE_SI:
-            # SI: airflow in m³/hr, density in kg/m³
-            # Mass flow = airflow (m³/hr) * density (kg/m³) / 3600 (s/hr) = kg/s
-            mass_flow = airflow_val * results_dict[KEY_DENS] / 3600.0
-        else:
-            # IP: airflow in CFM
-            if airflow_type == "ACFM":
-                # Actual CFM: use calculated density
-                # Density in lb/ft³, airflow in CFM
-                # Mass flow = CFM * density (lb/ft³) = lb/min
-                mass_flow = airflow_val * results_dict[KEY_DENS]
-            else:  # SCFM
-                # Standard CFM: use standard density 0.075 lb/ft³
-                mass_flow = airflow_val * 0.075
-        return mass_flow
+        # Helper function to get inputs dict from checkboxes and inputs
+        def get_inputs_dict(use_db_val, db_val, use_rh_val, rh_val, use_wb_val, wb_val, use_dp_val, dp_val):
+            selected_keys = []
+            inputs = {}
+            if use_db_val:
+                selected_keys.append("db")
+                inputs["db"] = db_val
+            else:
+                inputs["db"] = None
+            if use_rh_val:
+                selected_keys.append("rh")
+                inputs["rh"] = rh_val
+            else:
+                inputs["rh"] = None
+            if use_wb_val:
+                selected_keys.append("wb")
+                inputs["wb"] = wb_val
+            else:
+                inputs["wb"] = None
+            if use_dp_val:
+                selected_keys.append("dp")
+                inputs["dp"] = dp_val
+            else:
+                inputs["dp"] = None
+            return selected_keys, inputs
 
-    # Format helpers: 2 decimals default; 4 for humidity ratio and density
-    def fmt(key, val):
-        if key == KEY_HR or key == KEY_DENS:
-            return f"{val:.4f}"
-        return f"{val:.2f}"
+        # Point 1 inputs
+        selected_keys_1, inputs_1 = get_inputs_dict(use_db, db_input, use_rh, rh_input, use_wb, wb_input, use_dp, dp_input)
 
-    # Chart bounds in solver units (°C when SI, °F when IP)
-    t_min_solve = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
-    t_max_solve = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+        # Point 2 inputs (only in Process or Air Mixing mode)
+        if mode == "Process" or mode == "Air Mixing":
+            st.markdown("**Point 2:** Select **exactly two** of the four state inputs:")
+        
+            # Temperature inputs with unit conversion on system change
+            db_stored_2 = st.session_state.get("db_input2", None)
+            wb_stored_2 = st.session_state.get("wb_input2", None)
+            dp_stored_2 = st.session_state.get("dp_input2", None)
+        
+            # Convert if unit system changed and update session state
+            if unit_system_changed and db_stored_2 is not None:
+                if USE_SI:  # Switching to SI: convert °F to °C
+                    st.session_state["db_input2"] = f_to_c(db_stored_2)
+                    db_stored_2 = st.session_state["db_input2"]
+                    if wb_stored_2 is not None:
+                        st.session_state["wb_input2"] = f_to_c(wb_stored_2)
+                        wb_stored_2 = st.session_state["wb_input2"]
+                    if dp_stored_2 is not None:
+                        st.session_state["dp_input2"] = f_to_c(dp_stored_2)
+                        dp_stored_2 = st.session_state["dp_input2"]
+                else:  # Switching to IP: convert °C to °F
+                    st.session_state["db_input2"] = c_to_f(db_stored_2)
+                    db_stored_2 = st.session_state["db_input2"]
+                    if wb_stored_2 is not None:
+                        st.session_state["wb_input2"] = c_to_f(wb_stored_2)
+                        wb_stored_2 = st.session_state["wb_input2"]
+                    if dp_stored_2 is not None:
+                        st.session_state["dp_input2"] = c_to_f(dp_stored_2)
+                        dp_stored_2 = st.session_state["dp_input2"]
+        
+            # Point 2 inputs
+            db_default_2 = 29.0 if USE_SI else 85.0
+            db_value_2 = db_stored_2 if db_stored_2 is not None else db_default_2
+            db_sel_col_2, db_input_col_2 = st.columns([0.25, 0.75])
+            use_db_2 = db_sel_col_2.checkbox("DB", value=True, key="db2")
+            db_input_2 = db_input_col_2.number_input(f"Dry Bulb Temp ({TEMP_LABEL})", value=db_value_2, step=0.5, key="db_input2")
 
-    # Solve Point 1
-    if len(selected_keys_1) != 2:
-        st.warning("Point 1: Please select exactly two inputs (DB, RH, WB, DP).")
-        results_1 = None
-    else:
-        try:
-            results_1 = solve_state_from_two(
-                db=inputs_1["db"],
-                rh=inputs_1["rh"],
-                wb=inputs_1["wb"],
-                dp=inputs_1["dp"],
-                pressure=PRESSURE,
-                t_min=t_min_solve,
-                t_max=t_max_solve,
+            rh_sel_col_2, rh_input_col_2 = st.columns([0.25, 0.75])
+            use_rh_2 = rh_sel_col_2.checkbox("RH", value=True, key="rh2")
+            rh_input_2 = rh_input_col_2.number_input(
+                "Relative Humidity (%)", value=st.session_state.get("rh_input2", 40.0), step=0.5, min_value=0.0, max_value=100.0, key="rh_input2"
             )
-            if mode == "Single State Point":
-                st.success("Point 1 Calculated")
-                st.markdown("**Point 1 Properties:**")
-                use_grains = st.session_state.get("hr_grains_toggle", False)
-                for key, value in results_1.items():
-                    if key == KEY_HR:
-                        if not USE_SI and use_grains:
-                            st.metric("Humidity Ratio (gr/lb)", fmt(key, value * 7000.0))
+
+            wb_default_2 = 21.0 if USE_SI else 70.0
+            wb_value_2 = wb_stored_2 if wb_stored_2 is not None else wb_default_2
+            wb_sel_col_2, wb_input_col_2 = st.columns([0.25, 0.75])
+            use_wb_2 = wb_sel_col_2.checkbox("WB", value=False, key="wb2")
+            wb_input_2 = wb_input_col_2.number_input(f"Wet Bulb Temp ({TEMP_LABEL})", value=wb_value_2, step=0.5, key="wb_input2")
+
+            dp_default_2 = 15.5 if USE_SI else 60.0
+            dp_value_2 = dp_stored_2 if dp_stored_2 is not None else dp_default_2
+            dp_sel_col_2, dp_input_col_2 = st.columns([0.25, 0.75])
+            use_dp_2 = dp_sel_col_2.checkbox("DP", value=False, key="dp2")
+            dp_input_2 = dp_input_col_2.number_input(f"Dew Point Temp ({TEMP_LABEL})", value=dp_value_2, step=0.5, key="dp_input2")
+
+            # Airflow Input for Point 2
+            st.markdown("**Airflow:**")
+            if USE_SI:
+                airflow_2 = st.number_input("Airflow (m³/hr)", value=1000, step=100, min_value=0, key="airflow_2", format="%d")
+                airflow_type_2 = None
+            else:
+                airflow_col_2, type_col_2 = st.columns([0.7, 0.3])
+                with airflow_col_2:
+                    airflow_2 = st.number_input("Airflow", value=1000, step=100, min_value=0, key="airflow_2", format="%d")
+                with type_col_2:
+                    airflow_type_2 = st.radio("", ["ACFM", "SCFM"], index=0, key="airflow_type_2", horizontal=True, label_visibility="collapsed")
+        
+            # Display mass flow below airflow input (updated after Point 2 is solved)
+            mass_flow_2_display = st.session_state.get("mass_flow_2_display", None)
+            if mass_flow_2_display is not None:
+                if USE_SI:
+                    st.caption(f":gray[Mass Flow: {mass_flow_2_display:.3f} kg/s]")
+                else:
+                    st.caption(f":gray[Mass Flow: {mass_flow_2_display:.2f} lb/min]")
+
+            st.divider()
+            selected_keys_2, inputs_2 = get_inputs_dict(use_db_2, db_input_2, use_rh_2, rh_input_2, use_wb_2, wb_input_2, use_dp_2, dp_input_2)
+        else:
+            selected_keys_2, inputs_2 = None, None
+            airflow_2 = 0.0
+            airflow_type_2 = "ACFM"
+            mass_flow_2 = None
+
+        # Mass flow calculation helper
+        def calculate_mass_flow(airflow_val, airflow_type, results_dict=None):
+            """Calculate mass flow rate from airflow.
+            Returns mass flow in lb/min (IP) or kg/s (SI)"""
+            if results_dict is None or KEY_DENS not in results_dict:
+                return None
+            if USE_SI:
+                # SI: airflow in m³/hr, density in kg/m³
+                # Mass flow = airflow (m³/hr) * density (kg/m³) / 3600 (s/hr) = kg/s
+                mass_flow = airflow_val * results_dict[KEY_DENS] / 3600.0
+            else:
+                # IP: airflow in CFM
+                if airflow_type == "ACFM":
+                    # Actual CFM: use calculated density
+                    # Density in lb/ft³, airflow in CFM
+                    # Mass flow = CFM * density (lb/ft³) = lb/min
+                    mass_flow = airflow_val * results_dict[KEY_DENS]
+                else:  # SCFM
+                    # Standard CFM: use standard density 0.075 lb/ft³
+                    mass_flow = airflow_val * 0.075
+            return mass_flow
+
+        # Format helpers: 2 decimals default; 4 for humidity ratio and density
+        def fmt(key, val):
+            if key == KEY_HR or key == KEY_DENS:
+                return f"{val:.4f}"
+            return f"{val:.2f}"
+
+        # Chart bounds in solver units (°C when SI, °F when IP)
+        t_min_solve = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
+        t_max_solve = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+
+        # Solve Point 1
+        if len(selected_keys_1) != 2:
+            st.warning("Point 1: Please select exactly two inputs (DB, RH, WB, DP).")
+            results_1 = None
+        else:
+            try:
+                results_1 = solve_state_from_two(
+                    db=inputs_1["db"],
+                    rh=inputs_1["rh"],
+                    wb=inputs_1["wb"],
+                    dp=inputs_1["dp"],
+                    pressure=PRESSURE,
+                    t_min=t_min_solve,
+                    t_max=t_max_solve,
+                )
+                if mode == "Single State Point":
+                    st.success("Point 1 Calculated")
+                    st.markdown("**Point 1 Properties:**")
+                    use_grains = st.session_state.get("hr_grains_toggle", False)
+                    for key, value in results_1.items():
+                        if key == KEY_HR:
+                            if not USE_SI and use_grains:
+                                st.metric("Humidity Ratio (gr/lb)", fmt(key, value * 7000.0))
+                            else:
+                                st.metric(key, fmt(key, value))
                         else:
                             st.metric(key, fmt(key, value))
-                    else:
-                        st.metric(key, fmt(key, value))
-                # Display airflow as a property
-                if USE_SI:
-                    st.metric("Airflow", f"{format_airflow(airflow_1)} m³/hr")
+                    # Display airflow as a property
+                    if USE_SI:
+                        st.metric("Airflow", f"{format_airflow(airflow_1)} m³/hr")
                 else:
                     airflow_label = f"{format_airflow(airflow_1)} {airflow_type_1}" if airflow_type_1 else f"{format_airflow(airflow_1)} CFM"
                     st.metric("Airflow", airflow_label)
@@ -760,11 +864,11 @@ with col1:
                 
                 # Store mass flow for display below airflow input
                 st.session_state["mass_flow_1_display"] = mass_flow_1
-        except Exception as e:
-            st.error(f"Point 1: Unable to solve state from selected inputs: {e}")
-            results_1 = None
+            except Exception as e:
+                st.error(f"Point 1: Unable to solve state from selected inputs: {e}")
+                results_1 = None
 
-    # Solve Point 2 (only in Process or Air Mixing mode)
+        # Solve Point 2 (only in Process or Air Mixing mode)
     results_2 = None
     if mode == "Process" or mode == "Air Mixing":
         if len(selected_keys_2) != 2:
@@ -1464,6 +1568,7 @@ with col2:
             valid_x.append(x)
             valid_y.append(y_hr * y_scale)
 
+    cycle_arrow_annotations = []
     # 9. Plot User State Point(s) (if solved)
     if mode == "Single State Point" and results_1 is not None:
         results = results_1
@@ -1773,6 +1878,109 @@ with col2:
         
         results = None  # Not used in mixing mode
 
+    elif mode == "Cycle Analysis":
+        results_ra = st.session_state.get("cycle_ra")
+        results_oa = st.session_state.get("cycle_oa")
+        results_ma = st.session_state.get("cycle_ma")
+        cycle_points = st.session_state.get("cycle_points", [])
+        pct_oa = st.session_state.get("cycle_pct_oa", 20.0)
+        if results_ma is not None:
+            hr_ra = (results_ra[KEY_HR] * y_scale) if results_ra is not None else None
+            hr_oa = (results_oa[KEY_HR] * y_scale) if results_oa is not None else None
+            hr_ma = results_ma[KEY_HR] * y_scale
+            # 100% OA: only OA visible; OA is the start of the chain. 0% OA: only RA visible; RA is the start.
+            if pct_oa >= 99.5:
+                pts_x = [results_oa[KEY_DB]]
+                pts_y = [hr_oa]
+                for pt in cycle_points:
+                    pts_x.append(pt["state"][KEY_DB])
+                    pts_y.append(pt["state"][KEY_HR] * y_scale)
+                if len(pts_x) > 1:
+                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(
+                    x=[results_oa[KEY_DB]], y=[hr_oa],
+                    mode='markers+text', text=['Outside Air'], textposition='top center',
+                    marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                ))
+            elif pct_oa <= 0.5:
+                pts_x = [results_ra[KEY_DB]]
+                pts_y = [hr_ra]
+                for pt in cycle_points:
+                    pts_x.append(pt["state"][KEY_DB])
+                    pts_y.append(pt["state"][KEY_HR] * y_scale)
+                if len(pts_x) > 1:
+                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(
+                    x=[results_ra[KEY_DB]], y=[hr_ra],
+                    mode='markers+text', text=['Return Air'], textposition='top center',
+                    marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                ))
+            else:
+                # Mixed: show RA, OA, MA and mixing lines
+                fig.add_trace(go.Scatter(
+                    x=[results_oa[KEY_DB], results_ma[KEY_DB]], y=[hr_oa, hr_ma],
+                    mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[results_ra[KEY_DB], results_ma[KEY_DB]], y=[hr_ra, hr_ma],
+                    mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                ))
+                pts_x = [results_ma[KEY_DB]]
+                pts_y = [hr_ma]
+                for pt in cycle_points:
+                    pts_x.append(pt["state"][KEY_DB])
+                    pts_y.append(pt["state"][KEY_HR] * y_scale)
+                if len(pts_x) > 1:
+                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(
+                    x=[results_ra[KEY_DB]], y=[hr_ra],
+                    mode='markers+text', text=['Return'], textposition='top center',
+                    marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[results_oa[KEY_DB]], y=[hr_oa],
+                    mode='markers+text', text=['Outside'], textposition='top center',
+                    marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[results_ma[KEY_DB]], y=[hr_ma],
+                    mode='markers+text', text=['Mixed Air'], textposition='top center',
+                    marker=dict(size=12, color='orange', symbol='diamond'), showlegend=False, hoverinfo='skip',
+                ))
+            for i, pt in enumerate(cycle_points):
+                fig.add_trace(go.Scatter(
+                    x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
+                    mode='markers+text', text=[pt["name"]], textposition='top center',
+                    marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
+                ))
+            def _arrow(ax, ay, x, y):
+                cycle_arrow_annotations.append(dict(
+                    x=x, y=y, ax=ax, ay=ay,
+                    xref="x", yref="y", axref="x", ayref="y",
+                    showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
+                ))
+            if pct_oa >= 99.5:
+                pts_x = [results_oa[KEY_DB]]
+                pts_y = [hr_oa]
+                for pt in cycle_points:
+                    pts_x.append(pt["state"][KEY_DB])
+                    pts_y.append(pt["state"][KEY_HR] * y_scale)
+                for i in range(len(pts_x) - 1):
+                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+            elif pct_oa <= 0.5:
+                pts_x = [results_ra[KEY_DB]]
+                pts_y = [hr_ra]
+                for pt in cycle_points:
+                    pts_x.append(pt["state"][KEY_DB])
+                    pts_y.append(pt["state"][KEY_HR] * y_scale)
+                for i in range(len(pts_x) - 1):
+                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+            else:
+                _arrow(results_oa[KEY_DB], hr_oa, results_ma[KEY_DB], hr_ma)
+                _arrow(results_ra[KEY_DB], hr_ra, results_ma[KEY_DB], hr_ma)
+                for i in range(len(pts_x) - 1):
+                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+
     # Add hover grid trace LAST (after all state points) so it's on top and receives hover everywhere
     # Critical: opacity must be > 0 for Plotly to register hover events; using 0.05 for reliability
     if len(grid_customdata) > 0:
@@ -1847,7 +2055,7 @@ with col2:
         hovermode="closest",
         font=dict(family="Arial", size=12, color="black"),
         margin=dict(l=10, r=10, t=30, b=10),
-        annotations=[],  # Property labels drawn as traces so state points can render on top
+        annotations=cycle_arrow_annotations if mode == "Cycle Analysis" else [],  # Cycle arrows, or property labels as traces
         legend=dict(
             x=0.02,
             y=0.98,
@@ -1860,6 +2068,41 @@ with col2:
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    if mode == "Cycle Analysis":
+        results_ra_t = st.session_state.get("cycle_ra")
+        results_oa_t = st.session_state.get("cycle_oa")
+        results_ma_t = st.session_state.get("cycle_ma")
+        cycle_points_t = st.session_state.get("cycle_points", [])
+        if results_ra_t is not None and results_oa_t is not None and results_ma_t is not None:
+            rows = [
+                ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]),
+                ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]),
+                ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]),
+            ]
+            for pt in cycle_points_t:
+                s = pt["state"]
+                rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP]))
+            st.subheader("Cycle Data")
+            df_cycle = pd.DataFrame(rows, columns=["Point Name", "DB", "WB", "RH", "Enthalpy", "Dew Point"])
+            st.dataframe(df_cycle, use_container_width=True, hide_index=True)
+            if len(cycle_points_t) > 0:
+                st.caption("To remove a user-added point, select it below and click Remove.")
+                rm_col1, rm_col2 = st.columns([2, 1])
+                with rm_col1:
+                    point_names = ["-- Select point to remove --"] + [pt["name"] for pt in cycle_points_t]
+                    selected_to_remove = st.selectbox(
+                        "User-added point to remove",
+                        options=point_names,
+                        key="cycle_select_remove",
+                        label_visibility="collapsed",
+                    )
+                with rm_col2:
+                    if st.button("Remove selected point", key="cycle_remove_btn"):
+                        if selected_to_remove and selected_to_remove != "-- Select point to remove --":
+                            updated = [p for p in cycle_points_t if p["name"] != selected_to_remove]
+                            st.session_state["cycle_points"] = updated
+                            st.rerun()
 
     st.divider()
     st.subheader("Chart & Altitude Settings")
@@ -1947,7 +2190,7 @@ with col2:
         st.checkbox("Enthalpy", value=st.session_state.get("show_enthalpy_lines", True), key="show_enthalpy_lines")
         st.checkbox("HR Grid", value=st.session_state.get("show_hr_lines", True), key="show_hr_lines")
 
-# Full-width section: Process mode — Point 1 | Point 2 | Process Summary
+# Full-width section: Process mode - Point 1 | Point 2 | Process Summary
 if st.session_state.get("mode") == "Process":
     r1 = st.session_state.get("results_1")
     r2 = st.session_state.get("results_2")
@@ -2063,7 +2306,7 @@ if st.session_state.get("mode") == "Process":
                         condensate_rate = water_removal / 8.34  # GPM
                         st.metric("Condensate Rate", f"{condensate_rate:.3f} GPM")
 
-# Full-width section: Air Mixing mode — Point 1 | Point 2 | Mixed Air Properties
+# Full-width section: Air Mixing mode - Point 1 | Point 2 | Mixed Air Properties
 if st.session_state.get("mode") == "Air Mixing":
     r1 = st.session_state.get("results_1")
     r2 = st.session_state.get("results_2")
