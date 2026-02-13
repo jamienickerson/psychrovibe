@@ -2399,7 +2399,16 @@ if st.session_state.get("mode") == "Process":
                 st.metric("Δ Humidity Ratio (gr/lb)", _fmt(KEY_HR, delta_hr * 7000.0))
             else:
                 st.metric(f"Δ {KEY_HR}", _fmt(KEY_HR, delta_hr))
-            
+            # Sensible Heat Ratio: sensible / total (0 to 1). Latent = h_fg * ΔW; sensible = Δh - latent.
+            if abs(delta_enthalpy) > 1e-9:
+                h_fg = 2_501_000.0 if use_si_deltas else 1061.0  # J/kg or Btu/lb
+                delta_latent = h_fg * delta_hr
+                delta_sensible = delta_enthalpy - delta_latent
+                shr = delta_sensible / delta_enthalpy
+                shr = max(0.0, min(1.0, shr))
+                st.metric("Sensible Heat Ratio", f"{shr:.2f}")
+            else:
+                st.metric("Sensible Heat Ratio", "—")
             # Thermal Energy: ΔEnthalpy * Mass Flow
             if mass_flow_1 is not None:
                 if use_si_deltas:
@@ -2563,3 +2572,17 @@ if st.session_state.get("mode") == "Air Mixing":
         else:
             st.warning("Mixed air calculation requires valid mass flows for both points.")
             st.session_state["results_mix"] = None
+
+# --- FOOTER / DISCLAIMER ---
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center; color: #666666; font-size: 12px;'>
+        <p>© 2026 <b>Jamie Nickerson</b>. All Rights Reserved.</p>
+        <p><b>Engineering Disclaimer:</b> This tool utilizes open-source libraries for psychrometric calculations. 
+        While every effort has been made to ensure accuracy, this software is for reference only and should not be used as the sole basis for critical infrastructure design. 
+        The user assumes all risk and liability for the use of these results.</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
