@@ -1054,6 +1054,38 @@ with col2:
     # Scale factor for y-axis (grains only in IP)
     y_scale = (7000.0 if use_grains else 1.0) if not USE_SI else 1.0
 
+    # Dark mode: use theme-aware colors so legend and labels are visible (Streamlit 1.46+)
+    is_dark = False
+    try:
+        if hasattr(st, "context") and hasattr(st.context, "theme"):
+            t = getattr(st.context.theme, "type", None)
+            if t == "dark":
+                is_dark = True
+    except Exception:
+        pass
+    if is_dark:
+        chart_paper_bg = "rgba(14,17,23,0)"
+        chart_plot_bg = "#1e1e1e"
+        chart_font_color = "rgba(255,255,255,0.95)"
+        chart_primary_line_color = "rgba(255,255,255,0.85)"
+        legend_bg = "rgba(30,30,30,0.95)"
+        legend_font_color = "rgba(255,255,255,0.95)"
+        chart_annotation_bg = "rgba(40,40,40,0.95)"
+        chart_annotation_font_color = "rgba(255,255,255,0.95)"
+        hover_bg = "rgba(40,40,40,0.98)"
+        hover_font_color = "rgba(255,255,255,0.95)"
+    else:
+        chart_paper_bg = "white"
+        chart_plot_bg = "white"
+        chart_font_color = "black"
+        chart_primary_line_color = PRIMARY_LINE_COLOR
+        legend_bg = "rgba(255, 255, 255, 0.85)"
+        legend_font_color = "black"
+        chart_annotation_bg = "rgba(255, 255, 255, 0.9)"
+        chart_annotation_font_color = "#333"
+        hover_bg = "white"
+        hover_font_color = "black"
+
     # Create Plotly Figure (visuals match reference: order and styles)
     fig = go.Figure()
 
@@ -1069,7 +1101,7 @@ with col2:
                 x=[db, db],
                 y=[0, hr_capped * y_scale],
                 mode='lines',
-                line=dict(color=PRIMARY_LINE_COLOR, width=1),
+                line=dict(color=chart_primary_line_color, width=1),
                 opacity=0.4,
                 showlegend=False,
                 hoverinfo='skip'
@@ -1079,7 +1111,7 @@ with col2:
                 x=[db, db],
                 y=[0, hr_capped * y_scale],
                 mode='lines',
-                line=dict(color=PRIMARY_LINE_COLOR, width=0.5),
+                line=dict(color=chart_primary_line_color, width=0.5),
                 opacity=0.2,
                 showlegend=False,
                 hoverinfo='skip'
@@ -1446,7 +1478,7 @@ with col2:
             y=rh_hr_scaled,
             mode='lines',
             name=f'{rh}% RH',
-            line=dict(color=PRIMARY_LINE_COLOR, width=1),
+            line=dict(color=chart_primary_line_color, width=1),
             opacity=0.55,
             showlegend=False,
             hoverinfo='skip'
@@ -1463,8 +1495,8 @@ with col2:
                 showarrow=False,
                 xref="x",
                 yref="y",
-                font=dict(size=9, color="#666666"),
-                bgcolor="rgba(0,0,0,0)",
+                font=dict(size=9, color=chart_annotation_font_color),
+                bgcolor=chart_annotation_bg,
                 bordercolor="rgba(0,0,0,0)",
                 borderwidth=0,
                 borderpad=0,
@@ -1477,7 +1509,7 @@ with col2:
         y=sat_hr_scaled,
         mode='lines',
         name='Saturation Line (100% RH)',
-        line=dict(color=PRIMARY_LINE_COLOR, width=2)
+        line=dict(color=chart_primary_line_color, width=2)
     ))
 
     # Legend-only traces for Wet Bulb, Dew Point, Enthalpy, and HR Grid
@@ -1523,8 +1555,8 @@ with col2:
                 yref="y",
                 xanchor="right",
                 yanchor="middle",
-                font=dict(size=9, color=WB_LINE_COLOR),
-                bgcolor="rgba(255, 255, 255, 0.9)",
+                font=dict(size=9, color=chart_annotation_font_color),
+                bgcolor=chart_annotation_bg,
                 bordercolor="rgba(0,0,0,0)",
                 borderwidth=0,
                 borderpad=2,
@@ -1543,8 +1575,8 @@ with col2:
                 yref="y",
                 xanchor="left",
                 yanchor="middle",
-                font=dict(size=9, color=DP_LINE_COLOR),
-                bgcolor="rgba(255, 255, 255, 0.9)",
+                font=dict(size=9, color=chart_annotation_font_color),
+                bgcolor=chart_annotation_bg,
                 bordercolor="rgba(0,0,0,0)",
                 borderwidth=0,
                 borderpad=2,
@@ -1563,8 +1595,8 @@ with col2:
                 yref="y",
                 xanchor="right",
                 yanchor="middle",
-                font=dict(size=9, color='#8B0000'),
-                bgcolor="rgba(255, 255, 255, 0.9)",
+                font=dict(size=9, color=chart_annotation_font_color),
+                bgcolor=chart_annotation_bg,
                 bordercolor="rgba(0,0,0,0)",
                 borderwidth=0,
                 borderpad=2,
@@ -1584,7 +1616,7 @@ with col2:
             mode="text",
             text=[ann["text"]],
             textposition=textpos,
-            textfont=ann.get("font", dict(size=9, color="#333")),
+            textfont=ann.get("font", dict(size=9, color=chart_annotation_font_color)),
             showlegend=False,
             hoverinfo="skip",
         ))
@@ -1650,8 +1682,8 @@ with col2:
             customdata=state_customdata,
             hovertemplate=hover_tmpl,
             hoverlabel=dict(
-                bgcolor="#ffcccc",  # light red
-                font_color="black",
+                bgcolor="#ffcccc" if not is_dark else "rgba(80,40,40,0.98)",
+                font_color=hover_font_color,
             ),
         ))
     
@@ -1693,7 +1725,7 @@ with col2:
             hovertemplate=hover_tmpl_1,
             hoverlabel=dict(
                 bgcolor="#ccccff",
-                font_color="black",
+                font_color=hover_font_color,
             ),
         ))
         
@@ -1732,7 +1764,7 @@ with col2:
             hovertemplate=hover_tmpl_2,
             hoverlabel=dict(
                 bgcolor="#ccffcc",
-                font_color="black",
+                font_color=hover_font_color,
             ),
         ))
         
@@ -1827,7 +1859,7 @@ with col2:
             hovertemplate=hover_tmpl_1,
             hoverlabel=dict(
                 bgcolor="#ccccff",
-                font_color="black",
+                font_color=hover_font_color,
             ),
         ))
         
@@ -1866,7 +1898,7 @@ with col2:
             hovertemplate=hover_tmpl_2,
             hoverlabel=dict(
                 bgcolor="#ccffcc",
-                font_color="black",
+                font_color=hover_font_color,
             ),
         ))
         
@@ -1906,7 +1938,7 @@ with col2:
                 hovertemplate=hover_tmpl_mix,
                 hoverlabel=dict(
                     bgcolor="#ffddcc",
-                    font_color="black",
+                    font_color=hover_font_color,
                 ),
             ))
         
@@ -2051,7 +2083,7 @@ with col2:
             customdata=grid_customdata,
             name='_hover_grid',
             visible=True,
-            hoverlabel=dict(bgcolor="white", font_size=11),
+            hoverlabel=dict(bgcolor=hover_bg, font_size=11, font_color=hover_font_color),
         ))
 
     # Chart cosmetics (reference style)
@@ -2096,9 +2128,10 @@ with col2:
         ),
         height=800,
         autosize=True,
-        plot_bgcolor='white',
+        paper_bgcolor=chart_paper_bg,
+        plot_bgcolor=chart_plot_bg,
         hovermode="closest",
-        font=dict(family="Arial", size=12, color="black"),
+        font=dict(family="Arial", size=12, color=chart_font_color),
         margin=dict(l=10, r=10, t=30, b=10),
         annotations=cycle_arrow_annotations if mode == "Cycle Analysis" else [],  # Cycle arrows, or property labels as traces
         legend=dict(
@@ -2106,9 +2139,10 @@ with col2:
             y=0.98,
             xanchor="left",
             yanchor="top",
-            bgcolor="rgba(255, 255, 255, 0.85)",
-            bordercolor="lightgray",
+            bgcolor=legend_bg,
+            bordercolor="rgba(128,128,128,0.5)" if is_dark else "lightgray",
             borderwidth=1,
+            font=dict(color=legend_font_color),
         ),
     )
 
