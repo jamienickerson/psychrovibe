@@ -38,6 +38,18 @@ def f_to_c(temp_f):
 def c_to_f(temp_c):
     return temp_c * 9.0 / 5.0 + 32.0
 
+def btu_lb_to_j_kg(h_btu_lb):
+    return h_btu_lb * 2326.0  # 1 Btu/lb ≈ 2326 J/kg
+
+def j_kg_to_btu_lb(h_j_kg):
+    return h_j_kg / 2326.0
+
+def cfm_to_m3_hr(cfm):
+    return cfm * (0.0283168 * 60.0)  # 1 ft³/min = 1.699 m³/hr
+
+def m3_hr_to_cfm(m3_hr):
+    return m3_hr / (0.0283168 * 60.0)
+
 # Unit-aware label constants (used for result dict keys and display)
 if USE_SI:
     KEY_DB, KEY_WB, KEY_DP = "Dry Bulb (°C)", "Wet Bulb (°C)", "Dew Point (°C)"
@@ -508,6 +520,39 @@ with col1:
             st.session_state["cycle_oa_db"] = 95.0 if not USE_SI else 35.0
         if "cycle_oa_rh" not in st.session_state:
             st.session_state["cycle_oa_rh"] = 40.0
+
+        # On unit toggle, convert cycle inputs so thermodynamic values stay the same (e.g. 104°F -> 40°C)
+        if unit_system_changed:
+            if USE_SI:  # switching to SI: convert stored IP values to SI
+                st.session_state["cycle_ra_db"] = f_to_c(st.session_state["cycle_ra_db"])
+                st.session_state["cycle_oa_db"] = f_to_c(st.session_state["cycle_oa_db"])
+                st.session_state["cycle_total_airflow"] = int(round(cfm_to_m3_hr(st.session_state["cycle_total_airflow"])))
+                o_db, o_wb, o_dp = "Dry Bulb (°F)", "Wet Bulb (°F)", "Dew Point (°F)"
+                o_enth, o_vol, o_dens = "Enthalpy (Btu/lb)", "Specific Vol (ft³/lb)", "Moist Air Density (lb/ft³)"
+                o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (lb/lb)"
+                for pt in st.session_state.get("cycle_points", []):
+                    s = pt["state"]
+                    pt["state"] = {
+                        KEY_DB: f_to_c(s[o_db]), KEY_WB: f_to_c(s[o_wb]), KEY_DP: f_to_c(s[o_dp]),
+                        KEY_RH: s[o_rh], KEY_HR: s[o_hr],
+                        KEY_ENTH: btu_lb_to_j_kg(s[o_enth]),
+                        KEY_VOL: s[o_vol] * 0.062428, KEY_DENS: s[o_dens] * 16.0185,
+                    }
+            else:  # switching to IP: convert stored SI values to IP
+                st.session_state["cycle_ra_db"] = c_to_f(st.session_state["cycle_ra_db"])
+                st.session_state["cycle_oa_db"] = c_to_f(st.session_state["cycle_oa_db"])
+                st.session_state["cycle_total_airflow"] = int(round(m3_hr_to_cfm(st.session_state["cycle_total_airflow"])))
+                o_db, o_wb, o_dp = "Dry Bulb (°C)", "Wet Bulb (°C)", "Dew Point (°C)"
+                o_enth, o_vol, o_dens = "Enthalpy (J/kg)", "Specific Vol (m³/kg)", "Moist Air Density (kg/m³)"
+                o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (kg/kg)"
+                for pt in st.session_state.get("cycle_points", []):
+                    s = pt["state"]
+                    pt["state"] = {
+                        KEY_DB: c_to_f(s[o_db]), KEY_WB: c_to_f(s[o_wb]), KEY_DP: c_to_f(s[o_dp]),
+                        KEY_RH: s[o_rh], KEY_HR: s[o_hr],
+                        KEY_ENTH: j_kg_to_btu_lb(s[o_enth]),
+                        KEY_VOL: s[o_vol] / 0.062428, KEY_DENS: s[o_dens] / 16.0185,
+                    }
 
         st.markdown("**Mixing Box**")
         if USE_SI:
@@ -2075,16 +2120,60 @@ with col2:
         results_ma_t = st.session_state.get("cycle_ma")
         cycle_points_t = st.session_state.get("cycle_points", [])
         if results_ra_t is not None and results_oa_t is not None and results_ma_t is not None:
+            # Mass flow: actual volumetric airflow x actual moist-air density at MA (altitude, T, humidity).
+            # Energy: actual delta-enthalpy (PsychroLib) x actual mass flow — not 1.08*CFM*dT or similar.
+            # Condensate: actual mass flow x |delta humidity ratio|.
+            total_airflow = st.session_state.get("cycle_total_airflow", 10000.0 if not USE_SI else 5000.0)
+            if USE_SI:
+                mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS] / 3600.0  # kg/s
+            else:
+                mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS]  # lb/min
+
+            # Column headers with units; energy/condensate columns follow global IP/SI toggle
+            base_cols = ["Point Name", f"DB ({TEMP_LABEL})", f"WB ({TEMP_LABEL})", "RH (%)", f"Enthalpy ({ENTHALPY_LABEL})", f"Dew Point ({TEMP_LABEL})"]
+            if USE_SI:
+                cols = base_cols + ["Energy (kW)", "Condensate (L/min)"]
+            else:
+                cols = base_cols + ["Energy (BTU/hr)", "Condensate (GPM)"]
+            empty_extra = ("", "")  # for RA, OA, MA rows
             rows = [
-                ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]),
-                ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]),
-                ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]),
+                ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]) + empty_extra,
+                ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]) + empty_extra,
+                ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]) + empty_extra,
             ]
-            for pt in cycle_points_t:
+            for i, pt in enumerate(cycle_points_t):
                 s = pt["state"]
-                rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP]))
+                prev = results_ma_t if i == 0 else cycle_points_t[i - 1]["state"]
+                delta_h = s[KEY_ENTH] - prev[KEY_ENTH]
+                delta_hr = s[KEY_HR] - prev[KEY_HR]
+                if USE_SI:
+                    thermal_W = delta_h * mass_flow_cycle
+                    thermal_kw = thermal_W / 1000.0
+                    en_str = f"{thermal_kw:.2f}"
+                else:
+                    thermal_btuh = delta_h * mass_flow_cycle * 60.0
+                    en_str = f"{thermal_btuh:.0f}"
+                if delta_hr < 0:
+                    water_removal = mass_flow_cycle * abs(delta_hr)
+                    if USE_SI:
+                        lpm = water_removal * 60.0
+                        cond_str = f"{lpm:.3f}"
+                    else:
+                        gpm = water_removal / 8.34
+                        cond_str = f"{gpm:.3f}"
+                else:
+                    cond_str = ""
+                rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP], en_str, cond_str))
             st.subheader("Cycle Data")
-            df_cycle = pd.DataFrame(rows, columns=["Point Name", "DB", "WB", "RH", "Enthalpy", "Dew Point"])
+            df_cycle = pd.DataFrame(rows, columns=cols)
+            st.markdown(
+                "<style>"
+                "[data-testid='stDataFrame'] th, [data-testid='stDataFrame'] td, "
+                "[data-testid='stDataFrame'] table th, [data-testid='stDataFrame'] table td, "
+                ".stDataFrame th, .stDataFrame td { text-align: center !important; }"
+                "</style>",
+                unsafe_allow_html=True,
+            )
             st.dataframe(df_cycle, use_container_width=True, hide_index=True)
             if len(cycle_points_t) > 0:
                 st.caption("To remove a user-added point, select it below and click Remove.")
