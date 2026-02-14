@@ -149,7 +149,7 @@ def _markup_overlay_html(chart_data_url, width, height, stroke_width, stroke_col
 
 
 def _render_static_markup_page():
-    """Draw on a static psych_bg.png in the app folder. Cloud-friendly (no Kaleido)."""
+    """Draw on a static psych_bg.png in the app folder. Cloud-friendly (no Kaleido). Tools are in col1."""
     psych_bg_path = Path(__file__).resolve().parent / "psych_bg.png"
     if not psych_bg_path.is_file():
         st.info("Add **psych_bg.png** to the app folder (same directory as `app.py`) to use Markup mode.")
@@ -161,18 +161,11 @@ def _render_static_markup_page():
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
     chart_data_url = f"data:image/png;base64,{img_b64}"
 
-    st.header("Psychrometric Chart — Markup")
-    st.caption("Draw on the static chart image. If drawing or buttons don't work (e.g. on Streamlit Community Cloud), run the app locally.")
-
-    tb1, tb2 = st.columns([1, 2])
-    with tb1:
-        tool = st.radio("Tool", ["Pen", "Highlighter"], key="markup_static_tool_radio", horizontal=True, label_visibility="collapsed")
-    with tb2:
-        # Brand colors (blue = brand blue)
-        col_opt = ["#E63946", "#00A4EF", "#2A9D8F", "#9B59B6", "#F4D03F"]
-        labels = ["Red", "Blue", "Green", "Purple", "Yellow"]
-        sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_static_color_radio", horizontal=True, label_visibility="collapsed")
-        chosen_hex = col_opt[sel]
+    # Tool and color are in col1; read from session state
+    tool = st.session_state.get("markup_static_tool_radio", "Pen")
+    col_opt = ["#E63946", "#00A4EF", "#2A9D8F", "#9B59B6", "#F4D03F"]
+    sel = st.session_state.get("markup_static_color_radio", 0)
+    chosen_hex = col_opt[sel]
     stroke_width = 10 if tool == "Pen" else 20  # pen = half of highlighter
     hex_c = chosen_hex.lstrip("#")
     r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
@@ -181,7 +174,7 @@ def _render_static_markup_page():
         chart_data_url=chart_data_url, width=w, height=h,
         stroke_width=stroke_width, stroke_color=stroke_color_rgba, stroke_hex=chosen_hex,
     )
-    # Cap iframe height so large images fit on screen; chart scales inside via CSS max-height: 80vh
+    # No toolbar here; col2 is just the canvas so the image can fill the space. Cap iframe height for large images.
     iframe_h = min(h + 56, 720)
     st.components.v1.html(markup_html, height=iframe_h, scrolling=False)
 
@@ -688,6 +681,11 @@ with col1:
         st.markdown("**Point 1:** Select **exactly two** of the four state inputs:")
     elif mode == "Markup":
         st.caption("Draw on the static chart image. Add **psych_bg.png** to the app folder.")
+        st.markdown("**Drawing tools**")
+        tool = st.radio("Tool", ["Pen", "Highlighter"], key="markup_static_tool_radio", horizontal=True, label_visibility="collapsed")
+        col_opt = ["#E63946", "#00A4EF", "#2A9D8F", "#9B59B6", "#F4D03F"]
+        labels = ["Red", "Blue", "Green", "Purple", "Yellow"]
+        sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_static_color_radio", horizontal=True, label_visibility="collapsed")
     elif mode == "Cycle Analysis":
         # --- Cycle Analysis (AHU Builder) ---
         if "cycle_points" not in st.session_state:
