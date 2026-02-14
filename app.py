@@ -1,10 +1,140 @@
+import io
+import base64
 import streamlit as st
+# Patch for streamlit-drawable-canvas: image_to_url was removed/changed in Streamlit 1.40+.
+# The canvas passes (image, width_int, ...) but new Streamlit's image_to_url expects
+# layout_config with .width, causing 'int' object has no attribute 'width'. Use our impl.
+import streamlit.elements.image as _st_image
+def _image_to_url(image, *args, **kwargs):
+    """Return a data URL so canvas background loads; use JPEG for shorter URL (avoids truncation)."""
+    buf = io.BytesIO()
+    if hasattr(image, "save"):
+        if getattr(image, "mode", "") in ("RGBA", "P"):
+            image = image.convert("RGB")
+        image.save(buf, format="JPEG", quality=88)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return "data:image/jpeg;base64," + b64
+    else:
+        from PIL import Image as _PIL
+        arr = image
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        _PIL.Image.fromarray(arr).convert("RGB").save(buf, format="JPEG", quality=88)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return "data:image/jpeg;base64," + b64
+_st_image.image_to_url = _image_to_url
+
 import plotly.graph_objects as go
 import psychrolib
 import numpy as np
 import pandas as pd
 import math
-import base64
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
+
+
+def _markup_overlay_html(chart_data_url, width, height, stroke_width, stroke_color, stroke_hex):
+    """HTML + JS: chart as background with a transparent canvas overlay for drawing. Undo, Clear, Download."""
+    # Escape for embedding in HTML (data URL can contain commas and plus)
+    url_esc = chart_data_url.replace("\\", "\\\\").replace("'", "\\'")
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  #mup {{ position: relative; width: {width}px; height: {height}px; }}
+  #mup img {{ position: absolute; left:0; top:0; width:100%; height:100%; display:block; pointer-events:none; }}
+  #mup canvas {{ position: absolute; left:0; top:0; width:100%; height:100%; cursor:crosshair; }}
+  #mup-tb {{ display:flex; gap:8px; align-items:center; padding:6px 0; }}
+  #mup-tb button {{ padding:6px 12px; cursor:pointer; }}
+</style></head>
+<body>
+  <div id="mup-tb">
+    <button type="button" onclick="undo()">Undo</button>
+    <button type="button" onclick="clearAll()">Clear</button>
+    <button type="button" onclick="downloadImage()">Download image</button>
+  </div>
+  <div id="mup">
+    <img id="mup-bg" src="{url_esc}" alt="Chart" />
+    <canvas id="mup-canvas" width="{width}" height="{height}"></canvas>
+  </div>
+  <script>
+(function() {{
+  var canvas = document.getElementById('mup-canvas');
+  var img = document.getElementById('mup-bg');
+  var ctx = canvas.getContext('2d');
+  var strokes = [];
+  var current = [];
+  var strokeWidth = {stroke_width};
+  var strokeColor = '{stroke_color}';
+
+  function drawStroke(path) {{
+    if (path.length < 2) return;
+    ctx.strokeStyle = path.color;
+    ctx.lineWidth = path.width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(path.points[0].x, path.points[0].y);
+    for (var i = 1; i < path.points.length; i++)
+      ctx.lineTo(path.points[i].x, path.points[i].y);
+    ctx.stroke();
+  }}
+
+  function redraw() {{
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (var i = 0; i < strokes.length; i++) drawStroke(strokes[i]);
+  }}
+
+  canvas.addEventListener('mousedown', function(e) {{
+    var r = canvas.getBoundingClientRect();
+    var x = (e.clientX - r.left) * (canvas.width / r.width);
+    var y = (e.clientY - r.top) * (canvas.height / r.height);
+    current = {{ points: [{{x:x,y:y}}], color: strokeColor, width: strokeWidth }};
+    strokes.push(current);
+  }});
+  canvas.addEventListener('mousemove', function(e) {{
+    if (!current.points) return;
+    var r = canvas.getBoundingClientRect();
+    var x = (e.clientX - r.left) * (canvas.width / r.width);
+    var y = (e.clientY - r.top) * (canvas.height / r.height);
+    var last = current.points[current.points.length - 1];
+    ctx.strokeStyle = current.color;
+    ctx.lineWidth = current.width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(last.x, last.y);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    current.points.push({{x:x, y:y}});
+  }});
+  canvas.addEventListener('mouseup', function() {{ current = {{ points: null }}; }});
+  canvas.addEventListener('mouseleave', function() {{ current = {{ points: null }}; }});
+
+  window.undo = function() {{
+    if (strokes.length) {{ strokes.pop(); redraw(); }}
+  }};
+  window.clearAll = function() {{
+    strokes = [];
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }};
+  window.downloadImage = function() {{
+    var out = document.createElement('canvas');
+    out.width = canvas.width;
+    out.height = canvas.height;
+    var octx = out.getContext('2d');
+    octx.drawImage(img, 0, 0);
+    octx.drawImage(canvas, 0, 0);
+    var a = document.createElement('a');
+    a.download = 'psychro_chart_markup.png';
+    a.href = out.toDataURL('image/png');
+    a.click();
+  }};
+}})();
+  </script>
+</body>
+</html>
+"""
+
 
 # --- 1. CONFIGURATION & ENGINE ---
 st.set_page_config(page_title="PsychroVibe: Critical Cooling", layout="wide", page_icon="psychrovibe_logo.png")
@@ -2146,7 +2276,39 @@ with col2:
         ),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    markup_mode = st.session_state.get("markup_mode", False)
+    if markup_mode:
+        # Draw-on-chart: custom HTML overlay so the chart is the canvas (no dependency on component background).
+        try:
+            chart_img_bytes = fig.to_image(format="png", width=800, height=640, scale=1)
+        except Exception:
+            chart_img_bytes = fig.to_image(format="png", scale=1)
+        chart_b64 = base64.b64encode(chart_img_bytes).decode("utf-8")
+        chart_data_url = f"data:image/png;base64,{chart_b64}"
+        cw, ch = 800, 640
+
+        # Toolbar in Streamlit (tool and color); drawing + undo/clear/download live in the iframe
+        tb1, tb2 = st.columns([1, 2])
+        with tb1:
+            tool = st.radio("Tool", ["Pen", "Highlighter"], key="markup_tool_radio", horizontal=True, label_visibility="collapsed")
+        with tb2:
+            col_opt = ["#E63946", "#1D3557", "#2A9D8F", "#9B59B6", "#F4D03F"]
+            labels = ["Red", "Blue", "Green", "Purple", "Yellow"]
+            sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_color_radio", horizontal=True, label_visibility="collapsed")
+            chosen_hex = col_opt[sel]
+        stroke_width = 2 if tool == "Pen" else 20
+        hex_c = chosen_hex.lstrip("#")
+        r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+        stroke_color_hex = chosen_hex
+        stroke_color_rgba = f"rgba({r},{g},{b},0.3)" if tool == "Highlighter" else chosen_hex
+
+        markup_html = _markup_overlay_html(
+            chart_data_url=chart_data_url, width=cw, height=ch,
+            stroke_width=stroke_width, stroke_color=stroke_color_rgba, stroke_hex=stroke_color_hex,
+        )
+        st.components.v1.html(markup_html, height=ch + 56, scrolling=False)
+    else:
+        st.plotly_chart(fig, use_container_width=True)
 
     if mode == "Cycle Analysis":
         results_ra_t = st.session_state.get("cycle_ra")
@@ -2307,6 +2469,8 @@ with col2:
         st.session_state["use_si_units"] = (st.session_state["unit_radio"] == "°C (SI)")
         if not USE_SI:
             st.checkbox("HR in gr/lb", value=st.session_state.get("hr_grains_toggle", False), key="hr_grains_toggle")
+        st.markdown("**Markup**")
+        st.checkbox("Markup / Annotate", value=st.session_state.get("markup_mode", False), key="markup_mode")
         st.markdown("**Chart Lines**")
         st.checkbox("Wet Bulb", value=st.session_state.get("show_wb_lines", False), key="show_wb_lines")
         st.checkbox("Dew Point", value=st.session_state.get("show_dp_lines", False), key="show_dp_lines")
