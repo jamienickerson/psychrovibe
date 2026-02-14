@@ -1,5 +1,7 @@
 streamlit
 plotly
 psychrolib
-numpy
 pandas
+numpy
+streamlit-drawable-canvas
+kaleido
