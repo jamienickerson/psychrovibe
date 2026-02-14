@@ -703,6 +703,18 @@ with col1:
             st.session_state["cycle_oa_db"] = 95.0 if not USE_SI else 35.0
         if "cycle_oa_rh" not in st.session_state:
             st.session_state["cycle_oa_rh"] = 40.0
+        if "cycle_new_use_db" not in st.session_state:
+            st.session_state["cycle_new_use_db"] = True
+        if "cycle_new_use_rh" not in st.session_state:
+            st.session_state["cycle_new_use_rh"] = True
+        if "cycle_new_use_wb" not in st.session_state:
+            st.session_state["cycle_new_use_wb"] = False
+        if "cycle_new_use_dp" not in st.session_state:
+            st.session_state["cycle_new_use_dp"] = False
+        if "cycle_new_wb" not in st.session_state:
+            st.session_state["cycle_new_wb"] = 50.0 if not USE_SI else 10.0
+        if "cycle_new_dp" not in st.session_state:
+            st.session_state["cycle_new_dp"] = 45.0 if not USE_SI else 7.0
 
         # On unit toggle, convert cycle inputs so thermodynamic values stay the same (e.g. 104°F -> 40°C)
         if unit_system_changed:
@@ -710,6 +722,12 @@ with col1:
                 st.session_state["cycle_ra_db"] = f_to_c(st.session_state["cycle_ra_db"])
                 st.session_state["cycle_oa_db"] = f_to_c(st.session_state["cycle_oa_db"])
                 st.session_state["cycle_total_airflow"] = int(round(cfm_to_m3_hr(st.session_state["cycle_total_airflow"])))
+                if "cycle_new_db" in st.session_state:
+                    st.session_state["cycle_new_db"] = f_to_c(st.session_state["cycle_new_db"])
+                if "cycle_new_wb" in st.session_state:
+                    st.session_state["cycle_new_wb"] = f_to_c(st.session_state["cycle_new_wb"])
+                if "cycle_new_dp" in st.session_state:
+                    st.session_state["cycle_new_dp"] = f_to_c(st.session_state["cycle_new_dp"])
                 o_db, o_wb, o_dp = "Dry Bulb (°F)", "Wet Bulb (°F)", "Dew Point (°F)"
                 o_enth, o_vol, o_dens = "Enthalpy (Btu/lb)", "Specific Vol (ft³/lb)", "Moist Air Density (lb/ft³)"
                 o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (lb/lb)"
@@ -725,6 +743,12 @@ with col1:
                 st.session_state["cycle_ra_db"] = c_to_f(st.session_state["cycle_ra_db"])
                 st.session_state["cycle_oa_db"] = c_to_f(st.session_state["cycle_oa_db"])
                 st.session_state["cycle_total_airflow"] = int(round(m3_hr_to_cfm(st.session_state["cycle_total_airflow"])))
+                if "cycle_new_db" in st.session_state:
+                    st.session_state["cycle_new_db"] = c_to_f(st.session_state["cycle_new_db"])
+                if "cycle_new_wb" in st.session_state:
+                    st.session_state["cycle_new_wb"] = c_to_f(st.session_state["cycle_new_wb"])
+                if "cycle_new_dp" in st.session_state:
+                    st.session_state["cycle_new_dp"] = c_to_f(st.session_state["cycle_new_dp"])
                 o_db, o_wb, o_dp = "Dry Bulb (°C)", "Wet Bulb (°C)", "Dew Point (°C)"
                 o_enth, o_vol, o_dens = "Enthalpy (J/kg)", "Specific Vol (m³/kg)", "Moist Air Density (kg/m³)"
                 o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (kg/kg)"
@@ -795,19 +819,42 @@ with col1:
         cycle_points = st.session_state.get("cycle_points", [])
         if len(cycle_points) < 3:
             st.markdown("Add next component (leaving state):")
-            st.caption("Enter DB and RH for the leaving air state.")
-            c_db = st.number_input("DB (" + TEMP_LABEL + ")", value=55.0 if not USE_SI else 13.0, step=0.5, key="cycle_new_db")
-            c_rh = st.number_input("RH (%)", value=90.0, step=0.5, min_value=0.0, max_value=100.0, key="cycle_new_rh")
+            st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
+            c_db_sel, c_db_in = st.columns([0.25, 0.75])
+            with c_db_sel:
+                c_use_db = st.checkbox("DB", value=st.session_state.get("cycle_new_use_db", True), key="cycle_new_use_db")
+            with c_db_in:
+                c_db = st.number_input("DB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_db", 55.0 if not USE_SI else 13.0)), step=0.5, key="cycle_new_db")
+            c_rh_sel, c_rh_in = st.columns([0.25, 0.75])
+            with c_rh_sel:
+                c_use_rh = st.checkbox("RH", value=st.session_state.get("cycle_new_use_rh", True), key="cycle_new_use_rh")
+            with c_rh_in:
+                c_rh = st.number_input("RH (%)", value=float(st.session_state.get("cycle_new_rh", 90.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_new_rh")
+            c_wb_sel, c_wb_in = st.columns([0.25, 0.75])
+            with c_wb_sel:
+                c_use_wb = st.checkbox("WB", value=st.session_state.get("cycle_new_use_wb", False), key="cycle_new_use_wb")
+            with c_wb_in:
+                c_wb = st.number_input("WB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_wb", 50.0 if not USE_SI else 10.0)), step=0.5, key="cycle_new_wb")
+            c_dp_sel, c_dp_in = st.columns([0.25, 0.75])
+            with c_dp_sel:
+                c_use_dp = st.checkbox("DP", value=st.session_state.get("cycle_new_use_dp", False), key="cycle_new_use_dp")
+            with c_dp_in:
+                c_dp = st.number_input("DP (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_dp", 45.0 if not USE_SI else 7.0)), step=0.5, key="cycle_new_dp")
             c_name = st.text_input("Point name (e.g. Cooling Coil Leaving)", value="", key="cycle_new_name", placeholder="e.g. Coil Leaving")
             if st.button("Add Point", key="cycle_add_btn"):
-                try:
-                    pt_state = solve_state_from_two(db=c_db, rh=c_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
-                    name = c_name.strip() or f"Point {len(cycle_points)+1}"
-                    cycle_points = st.session_state.get("cycle_points", []) + [{"name": name, "state": pt_state}]
-                    st.session_state["cycle_points"] = cycle_points[:3]
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Invalid state: {ex}. Select exactly two of DB/RH/WB/DP.")
+                c_selected = [k for k, v in [("db", c_use_db), ("rh", c_use_rh), ("wb", c_use_wb), ("dp", c_use_dp)] if v]
+                if len(c_selected) != 2:
+                    st.warning("Please select exactly two inputs (DB, RH, WB, DP).")
+                else:
+                    c_inputs = {"db": c_db if c_use_db else None, "rh": c_rh if c_use_rh else None, "wb": c_wb if c_use_wb else None, "dp": c_dp if c_use_dp else None}
+                    try:
+                        pt_state = solve_state_from_two(db=c_inputs["db"], rh=c_inputs["rh"], wb=c_inputs["wb"], dp=c_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+                        name = c_name.strip() or f"Point {len(cycle_points)+1}"
+                        cycle_points = st.session_state.get("cycle_points", []) + [{"name": name, "state": pt_state}]
+                        st.session_state["cycle_points"] = cycle_points[:3]
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Invalid state: {ex}")
         for i, pt in enumerate(cycle_points):
             cols = st.columns([1, 0.15])
             with cols[0]:
