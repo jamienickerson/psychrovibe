@@ -1,10 +1,190 @@
+import io
+import base64
 import streamlit as st
+# Patch for streamlit-drawable-canvas: image_to_url was removed/changed in Streamlit 1.40+.
+# The canvas passes (image, width_int, ...) but new Streamlit's image_to_url expects
+# layout_config with .width, causing 'int' object has no attribute 'width'. Use our impl.
+import streamlit.elements.image as _st_image
+def _image_to_url(image, *args, **kwargs):
+    """Return a data URL so canvas background loads; use JPEG for shorter URL (avoids truncation)."""
+    buf = io.BytesIO()
+    if hasattr(image, "save"):
+        if getattr(image, "mode", "") in ("RGBA", "P"):
+            image = image.convert("RGB")
+        image.save(buf, format="JPEG", quality=88)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return "data:image/jpeg;base64," + b64
+    else:
+        from PIL import Image as _PIL
+        arr = image
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]
+        _PIL.Image.fromarray(arr).convert("RGB").save(buf, format="JPEG", quality=88)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return "data:image/jpeg;base64," + b64
+_st_image.image_to_url = _image_to_url
+
 import plotly.graph_objects as go
 import psychrolib
 import numpy as np
 import pandas as pd
 import math
-import base64
+from pathlib import Path
+from PIL import Image
+from streamlit_drawable_canvas import st_canvas
+
+
+def _markup_overlay_html(chart_data_url, width, height, stroke_width, stroke_color, stroke_hex):
+    """HTML + JS: chart as background with a transparent canvas overlay for drawing. Undo, Clear, Download."""
+    # Escape for embedding in HTML (data URL can contain commas and plus)
+    url_esc = chart_data_url.replace("\\", "\\\\").replace("'", "\\'")
+    return f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  #mup {{ position: relative; max-width: 100%; max-height: 80vh; width: 100%; aspect-ratio: {width} / {height}; }}
+  #mup img {{ position: absolute; left:0; top:0; width:100%; height:100%; display:block; pointer-events:none; object-fit: contain; }}
+  #mup canvas {{ position: absolute; left:0; top:0; width:100%; height:100%; cursor:crosshair; }}
+  #mup-tb {{ display:flex; gap:8px; align-items:center; padding:6px 0; }}
+  #mup-tb button {{ padding:6px 12px; cursor:pointer; }}
+</style></head>
+<body>
+  <div id="mup-tb">
+    <button type="button" onclick="undo()">Undo</button>
+    <button type="button" onclick="clearAll()">Clear</button>
+    <button type="button" onclick="downloadImage()">Download image</button>
+  </div>
+  <div id="mup">
+    <img id="mup-bg" src="{url_esc}" alt="Chart" />
+    <canvas id="mup-canvas" width="{width}" height="{height}"></canvas>
+  </div>
+  <script>
+(function() {{
+  var STORAGE_KEY = 'psychro_markup_strokes';
+  var canvas = document.getElementById('mup-canvas');
+  var img = document.getElementById('mup-bg');
+  var ctx = canvas.getContext('2d');
+  var strokes = [];
+  var current = [];
+  var strokeWidth = {stroke_width};
+  var strokeColor = '{stroke_color}';
+
+  function saveStrokes() {{
+    try {{ localStorage.setItem(STORAGE_KEY, JSON.stringify(strokes)); }} catch (e) {{}}
+  }}
+
+  function drawStroke(path) {{
+    if (!path.points || path.points.length < 2) return;
+    ctx.strokeStyle = path.color;
+    ctx.lineWidth = path.width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(path.points[0].x, path.points[0].y);
+    for (var i = 1; i < path.points.length; i++)
+      ctx.lineTo(path.points[i].x, path.points[i].y);
+    ctx.stroke();
+  }}
+
+  function redraw() {{
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    for (var i = 0; i < strokes.length; i++) drawStroke(strokes[i]);
+  }}
+
+  try {{
+    var saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {{ strokes = JSON.parse(saved); redraw(); }}
+  }} catch (e) {{}}
+
+  canvas.addEventListener('mousedown', function(e) {{
+    var r = canvas.getBoundingClientRect();
+    var x = (e.clientX - r.left) * (canvas.width / r.width);
+    var y = (e.clientY - r.top) * (canvas.height / r.height);
+    current = {{ points: [{{x:x,y:y}}], color: strokeColor, width: strokeWidth }};
+    strokes.push(current);
+  }});
+  canvas.addEventListener('mousemove', function(e) {{
+    if (!current.points) return;
+    var r = canvas.getBoundingClientRect();
+    var x = (e.clientX - r.left) * (canvas.width / r.width);
+    var y = (e.clientY - r.top) * (canvas.height / r.height);
+    var last = current.points[current.points.length - 1];
+    ctx.strokeStyle = current.color;
+    ctx.lineWidth = current.width;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(last.x, last.y);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    current.points.push({{x:x, y:y}});
+  }});
+  canvas.addEventListener('mouseup', function() {{ current = {{ points: null }}; saveStrokes(); }});
+  canvas.addEventListener('mouseleave', function() {{ current = {{ points: null }}; saveStrokes(); }});
+
+  window.undo = function() {{
+    if (strokes.length) {{ strokes.pop(); redraw(); saveStrokes(); }}
+  }};
+  window.clearAll = function() {{
+    strokes = [];
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    try {{ localStorage.removeItem(STORAGE_KEY); }} catch (e) {{}}
+  }};
+  window.downloadImage = function() {{
+    var out = document.createElement('canvas');
+    out.width = canvas.width;
+    out.height = canvas.height;
+    var octx = out.getContext('2d');
+    octx.drawImage(img, 0, 0);
+    octx.drawImage(canvas, 0, 0);
+    var a = document.createElement('a');
+    a.download = 'psychro_chart_markup.png';
+    a.href = out.toDataURL('image/png');
+    a.click();
+  }};
+}})();
+  </script>
+</body>
+</html>
+"""
+
+
+def _render_static_markup_page():
+    """Draw on a static psych_bg.png in the app folder. Cloud-friendly (no Kaleido)."""
+    psych_bg_path = Path(__file__).resolve().parent / "psych_bg.png"
+    if not psych_bg_path.is_file():
+        st.info("Add **psych_bg.png** to the app folder (same directory as `app.py`) to use Markup mode.")
+        return
+    with open(psych_bg_path, "rb") as f:
+        img_bytes = f.read()
+    img_pil = Image.open(psych_bg_path)
+    w, h = img_pil.size
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    chart_data_url = f"data:image/png;base64,{img_b64}"
+
+    st.header("Psychrometric Chart — Markup")
+    st.caption("Draw on the static chart image. If drawing or buttons don't work (e.g. on Streamlit Community Cloud), run the app locally.")
+
+    tb1, tb2 = st.columns([1, 2])
+    with tb1:
+        tool = st.radio("Tool", ["Pen", "Highlighter"], key="markup_static_tool_radio", horizontal=True, label_visibility="collapsed")
+    with tb2:
+        # Brand colors (blue = brand blue)
+        col_opt = ["#E63946", "#00A4EF", "#2A9D8F", "#9B59B6", "#F4D03F"]
+        labels = ["Red", "Blue", "Green", "Purple", "Yellow"]
+        sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_static_color_radio", horizontal=True, label_visibility="collapsed")
+        chosen_hex = col_opt[sel]
+    stroke_width = 10 if tool == "Pen" else 20  # pen = half of highlighter
+    hex_c = chosen_hex.lstrip("#")
+    r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+    stroke_color_rgba = f"rgba({r},{g},{b},0.15)" if tool == "Highlighter" else chosen_hex  # 50% more transparent
+    markup_html = _markup_overlay_html(
+        chart_data_url=chart_data_url, width=w, height=h,
+        stroke_width=stroke_width, stroke_color=stroke_color_rgba, stroke_hex=chosen_hex,
+    )
+    # Cap iframe height so large images fit on screen; chart scales inside via CSS max-height: 80vh
+    iframe_h = min(h + 56, 720)
+    st.components.v1.html(markup_html, height=iframe_h, scrolling=False)
+
 
 # --- 1. CONFIGURATION & ENGINE ---
 st.set_page_config(page_title="PsychroVibe: Critical Cooling", layout="wide", page_icon="psychrovibe_logo.png")
@@ -498,12 +678,16 @@ col1, col2 = st.columns([1, 3])
 with col1:
     st.header("Input State")
     # Mode selector: Single State Point, Process, Air Mixing, or Cycle Analysis
-    mode = st.radio("Mode:", ["Single State Point", "Process", "Air Mixing", "Cycle Analysis"], index=0)
-    
+    mode = st.radio("Mode:", ["Single State Point", "Process", "Air Mixing", "Cycle Analysis", "Markup"], index=0)
+    results_1 = None
+    results_2 = None
+
     if mode == "Process":
         st.markdown("**Point 1:** Select **exactly two** of the four state inputs:")
     elif mode == "Air Mixing":
         st.markdown("**Point 1:** Select **exactly two** of the four state inputs:")
+    elif mode == "Markup":
+        st.caption("Draw on the static chart image. Add **psych_bg.png** to the app folder.")
     elif mode == "Cycle Analysis":
         # --- Cycle Analysis (AHU Builder) ---
         if "cycle_points" not in st.session_state:
@@ -641,9 +825,10 @@ with col1:
         st.session_state["cycle_oa"] = results_oa
         st.session_state["cycle_ma"] = results_ma
     else:
-        st.markdown("Select **exactly two** of the four state inputs:")
+        if mode != "Markup":
+            st.markdown("Select **exactly two** of the four state inputs:")
 
-    if mode != "Cycle Analysis":
+    if mode != "Cycle Analysis" and mode != "Markup":
         # Temperature inputs with unit conversion on system change
         # Get stored values or defaults
         db_stored = st.session_state.get("db_input_1", None)
@@ -952,970 +1137,760 @@ with col1:
         results = None  # Will handle both points separately in chart section
 
 with col2:
-    st.header("Psychrometric Chart")
-    # Use global HR unit toggle for chart axis and hovers
-    use_grains = st.session_state.get("hr_grains_toggle", False)
-    # Chart line visibility toggles (read from session state, set in Chart Settings section)
-    show_wb_lines = st.session_state.get("show_wb_lines", False)
-    show_dp_lines = st.session_state.get("show_dp_lines", False)
-    show_enthalpy_lines = st.session_state.get("show_enthalpy_lines", True)
-    show_hr_lines = st.session_state.get("show_hr_lines", True)
-    
-    # Get mode and results from col1 scope (need to access them)
-    # We'll handle this by checking if results_1 and results_2 exist in session state or pass them differently
-    # For now, we'll check mode and results variables - but they're in col1 scope
-    # Actually, we can't directly access variables from col1 in col2. We need to use session state or restructure.
-    # Let me use session state to pass the mode and results
-
-    # Generate Chart Data (chart limits in °C when USE_SI, °F when IP)
-    if USE_SI:
-        chart_T_min = (chart_t_min - 32.0) * 5.0 / 9.0
-        chart_T_max = (chart_t_max - 32.0) * 5.0 / 9.0
+    if mode == "Markup":
+        _render_static_markup_page()
     else:
-        chart_T_min, chart_T_max = chart_t_min, chart_t_max
-    # Generate saturation curve with finer step for smoother appearance
-    sat_temps, sat_hr = get_saturation_curve(chart_T_min, chart_T_max, PRESSURE, step=0.5)
-    T_MIN, T_MAX = sat_temps[0], sat_temps[-1]
-    P = PRESSURE
+        st.header("Psychrometric Chart")
+        # Use global HR unit toggle for chart axis and hovers
+        use_grains = st.session_state.get("hr_grains_toggle", False)
+        # Chart line visibility toggles (read from session state, set in Chart Settings section)
+        show_wb_lines = st.session_state.get("show_wb_lines", False)
+        show_dp_lines = st.session_state.get("show_dp_lines", False)
+        show_enthalpy_lines = st.session_state.get("show_enthalpy_lines", True)
+        show_hr_lines = st.session_state.get("show_hr_lines", True)
+        
+        # Get mode and results from col1 scope (need to access them)
+        # We'll handle this by checking if results_1 and results_2 exist in session state or pass them differently
+        # For now, we'll check mode and results variables - but they're in col1 scope
+        # Actually, we can't directly access variables from col1 in col2. We need to use session state or restructure.
+        # Let me use session state to pass the mode and results
     
-    # Use natural saturation curve from psychrolib (already smooth and thermodynamically correct)
-    # Removed shape adjustment to maintain natural smooth curve appearance
-    max_hr = max([hr for hr in sat_hr if hr is not None])
-    # Lookup table for saturation humidity ratio by dry-bulb (to clip lines inside envelope)
-    sat_lookup = {int(t): hr for t, hr in zip(sat_temps, sat_hr) if hr is not None}
-
-    def get_sat_hr(t, sat_lookup, pressure):
-        """Saturation humidity ratio at t; use lookup first, then psychrolib so no point is skipped."""
-        v = sat_lookup.get(int(t))
-        if v is not None:
-            return v
-        try:
-            return psychrolib.GetSatHumRatio(t, pressure)
-        except Exception:
-            return None
-
-    def find_sat_intersection(t_lo, t_hi, w_at_t_func, tol=1e-6, max_iter=25):
-        """Find t in (t_lo, t_hi) where w_at_t_func(t) == get_sat_hr(t). Returns (t, w) or None."""
-        for _ in range(max_iter):
-            t_mid = (t_lo + t_hi) / 2.0
-            if t_hi - t_lo < tol:
-                ws = get_sat_hr(t_mid, sat_lookup, P)
-                if ws is not None:
-                    try:
-                        w_mid = w_at_t_func(t_mid)
-                        if w_mid is not None:
-                            return (t_mid, ws)
-                    except Exception:
-                        pass
-                return (t_mid, get_sat_hr(t_mid, sat_lookup, P)) if get_sat_hr(t_mid, sat_lookup, P) is not None else None
+        # Generate Chart Data (chart limits in °C when USE_SI, °F when IP)
+        if USE_SI:
+            chart_T_min = (chart_t_min - 32.0) * 5.0 / 9.0
+            chart_T_max = (chart_t_max - 32.0) * 5.0 / 9.0
+        else:
+            chart_T_min, chart_T_max = chart_t_min, chart_t_max
+        # Generate saturation curve with finer step for smoother appearance
+        sat_temps, sat_hr = get_saturation_curve(chart_T_min, chart_T_max, PRESSURE, step=0.5)
+        T_MIN, T_MAX = sat_temps[0], sat_temps[-1]
+        P = PRESSURE
+        
+        # Use natural saturation curve from psychrolib (already smooth and thermodynamically correct)
+        # Removed shape adjustment to maintain natural smooth curve appearance
+        max_hr = max([hr for hr in sat_hr if hr is not None])
+        # Lookup table for saturation humidity ratio by dry-bulb (to clip lines inside envelope)
+        sat_lookup = {int(t): hr for t, hr in zip(sat_temps, sat_hr) if hr is not None}
+    
+        def get_sat_hr(t, sat_lookup, pressure):
+            """Saturation humidity ratio at t; use lookup first, then psychrolib so no point is skipped."""
+            v = sat_lookup.get(int(t))
+            if v is not None:
+                return v
             try:
-                w_mid = w_at_t_func(t_mid)
+                return psychrolib.GetSatHumRatio(t, pressure)
             except Exception:
-                t_lo = t_mid
-                continue
-            ws_mid = get_sat_hr(t_mid, sat_lookup, P)
-            if ws_mid is None or w_mid is None:
-                t_lo = t_mid
-                continue
-            if abs(w_mid - ws_mid) < 1e-9:
-                return (t_mid, ws_mid)
-            if w_mid > ws_mid:
-                t_hi = t_mid
-            else:
-                t_lo = t_mid
-        return None
-
-    def find_sat_t_for_w(w_target, t_lo, t_hi, tol=1e-6, max_iter=25):
-        """Find t in (t_lo, t_hi) where get_sat_hr(t) == w_target. Returns t or None."""
-        for _ in range(max_iter):
-            t_mid = (t_lo + t_hi) / 2.0
-            if t_hi - t_lo < tol:
-                return t_mid
-            ws = get_sat_hr(t_mid, sat_lookup, P)
-            if ws is None:
-                t_lo = t_mid
-                continue
-            if abs(ws - w_target) < 1e-9:
-                return t_mid
-            if ws < w_target:
-                t_lo = t_mid
-            else:
-                t_hi = t_mid
-        return (t_lo + t_hi) / 2.0
-
-    # Cap chart top: max HR = humidity ratio at (DB=chart_t_max, WB=nearest 5°F >= 90% of chart_t_max)
-    wb_cap = math.ceil(0.9 * T_MAX / 5.0) * 5.0
-    try:
-        cap_hr = psychrolib.GetHumRatioFromTWetBulb(T_MAX, wb_cap, P)
-        max_hr = min(max_hr, cap_hr)
-    except Exception:
-        pass  # keep max_hr from saturation if WB cap fails
-
-    # Scale factor for y-axis (grains only in IP)
-    y_scale = (7000.0 if use_grains else 1.0) if not USE_SI else 1.0
-
-    # Dark mode: use theme-aware colors so legend and labels are visible (Streamlit 1.46+)
-    is_dark = False
-    try:
-        if hasattr(st, "context") and hasattr(st.context, "theme"):
-            t = getattr(st.context.theme, "type", None)
-            if t == "dark":
-                is_dark = True
-    except Exception:
-        pass
-    if is_dark:
-        chart_paper_bg = "rgba(14,17,23,0)"
-        chart_plot_bg = "#1e1e1e"
-        chart_font_color = "rgba(255,255,255,0.95)"
-        chart_primary_line_color = "rgba(255,255,255,0.85)"
-        legend_bg = "rgba(30,30,30,0.95)"
-        legend_font_color = "rgba(255,255,255,0.95)"
-        chart_annotation_bg = "rgba(40,40,40,0.95)"
-        chart_annotation_font_color = "rgba(255,255,255,0.95)"
-        hover_bg = "rgba(40,40,40,0.98)"
-        hover_font_color = "rgba(255,255,255,0.95)"
-    else:
-        chart_paper_bg = "white"
-        chart_plot_bg = "white"
-        chart_font_color = "black"
-        chart_primary_line_color = PRIMARY_LINE_COLOR
-        legend_bg = "rgba(255, 255, 255, 0.85)"
-        legend_font_color = "black"
-        chart_annotation_bg = "rgba(255, 255, 255, 0.9)"
-        chart_annotation_font_color = "#333"
-        hover_bg = "white"
-        hover_font_color = "black"
-
-    # Create Plotly Figure (visuals match reference: order and styles)
-    fig = go.Figure()
-
-    # 1. Dry Bulb grid lines - darker every 5°F, lighter every 1°F
-    for db in range(int(T_MIN), int(T_MAX) + 1, 1):
-        hr_top = sat_lookup.get(db)
-        if hr_top is None:
-            continue
-        hr_capped = min(hr_top, max_hr)
-        # Darker lines every 5°F, lighter lines every 1°F
-        if db % 5 == 0:
-            fig.add_trace(go.Scatter(
-                x=[db, db],
-                y=[0, hr_capped * y_scale],
-                mode='lines',
-                line=dict(color=chart_primary_line_color, width=1),
-                opacity=0.4,
-                showlegend=False,
-                hoverinfo='skip'
-            ))
-        else:
-            fig.add_trace(go.Scatter(
-                x=[db, db],
-                y=[0, hr_capped * y_scale],
-                mode='lines',
-                line=dict(color=chart_primary_line_color, width=0.5),
-                opacity=0.2,
-                showlegend=False,
-                hoverinfo='skip'
-            ))
-
-    # 2. Wet Bulb lines (every 5°F in both IP and SI) - solid royal blue, finer than DB/RH
-    wb_labels = []
-    WB_LINE_COLOR = "#4169E1"  # Royal blue
-    if show_wb_lines:
-        # 5°F increments in both modes: iterate in °F, convert to chart temp when SI
-        step_degF = 5
-        t_min_F = chart_t_min if not USE_SI else T_MIN * 9.0 / 5.0 + 32.0
-        t_max_F = chart_t_max if not USE_SI else T_MAX * 9.0 / 5.0 + 32.0
-        twb_F_start = int(t_min_F // step_degF) * step_degF
-        twb_F_end = int(t_max_F) - 10
-        for twb_F in range(twb_F_start, twb_F_end + 1, step_degF):
-            if USE_SI:
-                twb = (twb_F - 32.0) * 5.0 / 9.0  # chart temp in °C
-                # Round to nearest 5 °C for clean labels (15, 20, 25, 30) like IP
-                label_text = f'{int(round(twb / 5) * 5)}'
-            else:
-                twb = float(twb_F)
-                label_text = f'{twb_F}'
-            tdb_vals = []
-            w_vals = []
-            # WB line starts ON the saturation curve at dry-bulb = wet-bulb (100% RH), then extends right
-            t_start_wb = max(twb, T_MIN)
-            if t_start_wb >= T_MAX:
-                continue
-            ws_start = get_sat_hr(twb, sat_lookup, P)
-            if ws_start is None:
-                continue
-            # Start at saturation curve (twb, ws) then draw to T_MAX
-            for tdb in np.arange(t_start_wb, T_MAX + 0.5, 0.5):
+                return None
+    
+        def find_sat_intersection(t_lo, t_hi, w_at_t_func, tol=1e-6, max_iter=25):
+            """Find t in (t_lo, t_hi) where w_at_t_func(t) == get_sat_hr(t). Returns (t, w) or None."""
+            for _ in range(max_iter):
+                t_mid = (t_lo + t_hi) / 2.0
+                if t_hi - t_lo < tol:
+                    ws = get_sat_hr(t_mid, sat_lookup, P)
+                    if ws is not None:
+                        try:
+                            w_mid = w_at_t_func(t_mid)
+                            if w_mid is not None:
+                                return (t_mid, ws)
+                        except Exception:
+                            pass
+                    return (t_mid, get_sat_hr(t_mid, sat_lookup, P)) if get_sat_hr(t_mid, sat_lookup, P) is not None else None
                 try:
-                    w = psychrolib.GetHumRatioFromTWetBulb(tdb, twb, P)
+                    w_mid = w_at_t_func(t_mid)
                 except Exception:
+                    t_lo = t_mid
                     continue
-                ws = get_sat_hr(tdb, sat_lookup, P)
-                if ws is None or w is None or w < 0 or w > max_hr or w > ws:
+                ws_mid = get_sat_hr(t_mid, sat_lookup, P)
+                if ws_mid is None or w_mid is None:
+                    t_lo = t_mid
                     continue
-                tdb_vals.append(tdb)
-                w_vals.append(w)
-            # Ensure we include the curve start point so line begins exactly on saturation
-            if len(tdb_vals) == 0 or tdb_vals[0] > twb:
-                tdb_vals.insert(0, twb)
-                w_vals.insert(0, ws_start)
-            if len(tdb_vals) > 1:
-                w_vals_scaled = [w * y_scale for w in w_vals]
-                fig.add_trace(go.Scatter(
-                    x=tdb_vals,
-                    y=w_vals_scaled,
-                    mode='lines',
-                    line=dict(color=WB_LINE_COLOR, width=0.7),
-                    opacity=0.6,
-                    showlegend=False,
-                    hoverinfo='skip'
-                ))
-                # Label just left of saturation curve (small offset so label sits near the line)
-                twb_int = int(round(twb))
-                if twb_int >= int(T_MIN) and twb_int <= int(T_MAX):
-                    sat_w = sat_lookup.get(twb_int)
-                    if sat_w is not None:
-                        # Offset by ~1 degree so label is close to the line
-                        offset = 1.0 if (T_MAX - T_MIN) > 50 else 0.5
-                        wb_labels.append({
-                            'x': twb - offset,
-                            'y': sat_w * y_scale,
-                            'text': label_text,
-                            'twb': twb
-                        })
-
-    # 3. Dew Point lines (every 5°, same grid as WB) - solid green, finer than DB/RH
-    dp_labels = []
-    DP_LINE_COLOR = "green"
-    if show_dp_lines:
-        # Match WB: 5° increments in both IP and SI, aligned to 0s and 5s
-        step_deg = 5
-        if USE_SI:
-            t_min_C = T_MIN
-            t_max_C = T_MAX
-            tdp_start = int(t_min_C // step_deg) * step_deg
-            # Extend to full chart range so DP lines reach top of y-axis (e.g. 40 when chart goes to 40°C)
-            tdp_end = int(t_max_C)
-            for tdp in range(tdp_start, tdp_end + 1, step_deg):
-                if tdp < 0:
-                    continue
-                try:
-                    w_dp = psychrolib.GetHumRatioFromTDewPoint(tdp, P)
-                except Exception:
-                    continue
-                if w_dp <= 0 or w_dp >= max_hr:
-                    continue
-                t_left = find_sat_t_for_w(w_dp, T_MIN, T_MAX)
-                if t_left is None or t_left >= T_MAX:
-                    continue
-                t_vals = []
-                w_vals = []
-                for t in np.arange(t_left, T_MAX + 0.5, 0.5):
-                    t_vals.append(t)
-                    w_vals.append(w_dp)
-                if len(t_vals) == 0 or t_vals[0] > t_left:
-                    t_vals.insert(0, t_left)
-                    w_vals.insert(0, w_dp)
-                if len(t_vals) > 1:
-                    w_vals_scaled = [w * y_scale for w in w_vals]
-                    fig.add_trace(go.Scatter(
-                        x=t_vals,
-                        y=w_vals_scaled,
-                        mode='lines',
-                        line=dict(color=DP_LINE_COLOR, width=0.7),
-                        opacity=0.6,
-                        showlegend=False,
-                        hoverinfo='skip'
-                    ))
-                    label_x = T_MAX - (T_MAX - T_MIN) * 0.02
-                    label_y = w_dp * y_scale
-                    # Round to nearest 5 °C for label (15, 20, 25, 30) like WB
-                    dp_labels.append({
-                        'x': label_x,
-                        'y': label_y,
-                        'text': f'{int(round(tdp / 5) * 5)}',
-                        'tdp': tdp
-                    })
-        else:
-            # IP: use °F grid aligned to 5s (same as WB)
-            t_min_F = chart_t_min
-            t_max_F = chart_t_max
-            tdp_F_start = int(t_min_F // step_deg) * step_deg
-            tdp_F_end = int(t_max_F) - 10
-            for tdp_F in range(tdp_F_start, tdp_F_end + 1, step_deg):
-                tdp = float(tdp_F)
-                try:
-                    w_dp = psychrolib.GetHumRatioFromTDewPoint(tdp, P)
-                except Exception:
-                    continue
-                if w_dp <= 0 or w_dp >= max_hr:
-                    continue
-                t_left = find_sat_t_for_w(w_dp, T_MIN, T_MAX)
-                if t_left is None or t_left >= T_MAX:
-                    continue
-                t_vals = []
-                w_vals = []
-                for t in np.arange(t_left, T_MAX + 0.5, 0.5):
-                    t_vals.append(t)
-                    w_vals.append(w_dp)
-                if len(t_vals) == 0 or t_vals[0] > t_left:
-                    t_vals.insert(0, t_left)
-                    w_vals.insert(0, w_dp)
-                if len(t_vals) > 1:
-                    w_vals_scaled = [w * y_scale for w in w_vals]
-                    fig.add_trace(go.Scatter(
-                        x=t_vals,
-                        y=w_vals_scaled,
-                        mode='lines',
-                        line=dict(color=DP_LINE_COLOR, width=0.7),
-                        opacity=0.6,
-                        showlegend=False,
-                        hoverinfo='skip'
-                    ))
-                    label_x = T_MAX - (T_MAX - T_MIN) * 0.02
-                    label_y = w_dp * y_scale
-                    dp_labels.append({
-                        'x': label_x,
-                        'y': label_y,
-                        'text': f'{tdp_F}',
-                        'tdp': tdp
-                    })
-
-    # 4. Enthalpy lines - red/maroon, increments of 10 Btu/lb (IP) or 20 kJ/kg (SI)
-    enthalpy_labels = []
-    if show_enthalpy_lines:
-        try:
-            h_min = psychrolib.GetMoistAirEnthalpy(T_MIN, 0.0)
-        except Exception:
-            h_min = 0.0
-        try:
-            h_max = psychrolib.GetMoistAirEnthalpy(T_MAX, max_hr)
-        except Exception:
-            h_max = h_min + (60000.0 if USE_SI else 60.0)
-        if USE_SI:
-            h_step = 20000.0  # 20 kJ/kg increments
-            h_start = int(np.ceil(h_min / h_step) * h_step)
-            h_end = int(np.floor(h_max / h_step) * h_step)
-        else:
-            h_step = 10.0  # 10 Btu/lb increments
-            h_start = int(np.ceil(h_min / h_step) * h_step)
-            h_end = int(np.floor(h_max / h_step) * h_step)
-        for h in range(int(h_start), int(h_end) + 1, int(h_step)):
-            t_vals = []
-            w_vals = []
-            def w_at_t(t):
-                try:
-                    return psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t)
-                except Exception:
-                    return None
-            # Enthalpy line: at low T it's above saturation, at high T below. Find where it crosses into valid region (left boundary).
-            t_intersect = None
-            t_prev_above = None  # last t where line was above saturation
-            for t_test in np.arange(T_MIN, T_MAX + 0.5, 0.5):
-                try:
-                    w_test = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t_test)
-                except Exception:
-                    continue
-                ws_test = get_sat_hr(t_test, sat_lookup, P)
-                if ws_test is None or w_test is None:
-                    continue
-                if w_test > ws_test:
-                    # Above saturation (invalid), keep as candidate for left boundary
-                    t_prev_above = t_test
-                    continue
+                if abs(w_mid - ws_mid) < 1e-9:
+                    return (t_mid, ws_mid)
+                if w_mid > ws_mid:
+                    t_hi = t_mid
                 else:
-                    # First point at or below saturation: intersection is between t_prev_above and t_test
-                    if t_prev_above is not None:
-                        hit = find_sat_intersection(t_prev_above, t_test, w_at_t)
-                        if hit:
-                            t_intersect = hit[0]
-                    else:
-                        # Line already valid at T_MIN, start from T_MIN
-                        t_intersect = T_MIN
-                    break
-            if t_intersect is None:
+                    t_lo = t_mid
+            return None
+    
+        def find_sat_t_for_w(w_target, t_lo, t_hi, tol=1e-6, max_iter=25):
+            """Find t in (t_lo, t_hi) where get_sat_hr(t) == w_target. Returns t or None."""
+            for _ in range(max_iter):
+                t_mid = (t_lo + t_hi) / 2.0
+                if t_hi - t_lo < tol:
+                    return t_mid
+                ws = get_sat_hr(t_mid, sat_lookup, P)
+                if ws is None:
+                    t_lo = t_mid
+                    continue
+                if abs(ws - w_target) < 1e-9:
+                    return t_mid
+                if ws < w_target:
+                    t_lo = t_mid
+                else:
+                    t_hi = t_mid
+            return (t_lo + t_hi) / 2.0
+    
+        # Cap chart top: max HR = humidity ratio at (DB=chart_t_max, WB=nearest 5°F >= 90% of chart_t_max)
+        wb_cap = math.ceil(0.9 * T_MAX / 5.0) * 5.0
+        try:
+            cap_hr = psychrolib.GetHumRatioFromTWetBulb(T_MAX, wb_cap, P)
+            max_hr = min(max_hr, cap_hr)
+        except Exception:
+            pass  # keep max_hr from saturation if WB cap fails
+    
+        # Scale factor for y-axis (grains only in IP)
+        y_scale = (7000.0 if use_grains else 1.0) if not USE_SI else 1.0
+    
+        # Dark mode: use theme-aware colors so legend and labels are visible (Streamlit 1.46+)
+        is_dark = False
+        try:
+            if hasattr(st, "context") and hasattr(st.context, "theme"):
+                t = getattr(st.context.theme, "type", None)
+                if t == "dark":
+                    is_dark = True
+        except Exception:
+            pass
+        if is_dark:
+            chart_paper_bg = "rgba(14,17,23,0)"
+            chart_plot_bg = "#1e1e1e"
+            chart_font_color = "rgba(255,255,255,0.95)"
+            chart_primary_line_color = "rgba(255,255,255,0.85)"
+            legend_bg = "rgba(30,30,30,0.95)"
+            legend_font_color = "rgba(255,255,255,0.95)"
+            chart_annotation_bg = "rgba(40,40,40,0.95)"
+            chart_annotation_font_color = "rgba(255,255,255,0.95)"
+            hover_bg = "rgba(40,40,40,0.98)"
+            hover_font_color = "rgba(255,255,255,0.95)"
+        else:
+            chart_paper_bg = "white"
+            chart_plot_bg = "white"
+            chart_font_color = "black"
+            chart_primary_line_color = PRIMARY_LINE_COLOR
+            legend_bg = "rgba(255, 255, 255, 0.85)"
+            legend_font_color = "black"
+            chart_annotation_bg = "rgba(255, 255, 255, 0.9)"
+            chart_annotation_font_color = "#333"
+            hover_bg = "white"
+            hover_font_color = "black"
+    
+        # Create Plotly Figure (visuals match reference: order and styles)
+        fig = go.Figure()
+    
+        # 1. Dry Bulb grid lines - darker every 5°F, lighter every 1°F
+        for db in range(int(T_MIN), int(T_MAX) + 1, 1):
+            hr_top = sat_lookup.get(db)
+            if hr_top is None:
                 continue
-            # Draw from intersection point to T_MAX (right side of saturation curve)
-            for t in np.arange(t_intersect, T_MAX + 0.5, 0.5):
-                try:
-                    w = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t)
-                except Exception:
-                    continue
-                ws = get_sat_hr(t, sat_lookup, P)
-                if ws is None or w is None or w < 0 or w > max_hr or w > ws:
-                    continue
-                t_vals.append(t)
-                w_vals.append(w)
-            # Add intersection point at start if not already included
-            if len(t_vals) == 0 or t_vals[0] > t_intersect:
-                ws_int = get_sat_hr(t_intersect, sat_lookup, P)
-                if ws_int is not None:
-                    t_vals.insert(0, t_intersect)
-                    w_vals.insert(0, ws_int)
-            if len(t_vals) > 1:
-                w_vals_scaled = [w * y_scale for w in w_vals]
+            hr_capped = min(hr_top, max_hr)
+            # Darker lines every 5°F, lighter lines every 1°F
+            if db % 5 == 0:
                 fig.add_trace(go.Scatter(
-                    x=t_vals,
-                    y=w_vals_scaled,
+                    x=[db, db],
+                    y=[0, hr_capped * y_scale],
                     mode='lines',
-                    line=dict(color='#8B0000', width=1),  # Dark red/maroon
-                    opacity=0.6,
+                    line=dict(color=chart_primary_line_color, width=1),
+                    opacity=0.4,
                     showlegend=False,
                     hoverinfo='skip'
                 ))
-                # Label near left third of line
-                label_idx = max(0, len(t_vals) // 3)
-                if label_idx < len(t_vals) and label_idx < len(w_vals_scaled):
-                    h_label = f"{int(h/1000)}" if USE_SI else f"{int(h)}"
-                    enthalpy_labels.append(dict(
-                        x=t_vals[label_idx],
-                        y=w_vals_scaled[label_idx],
-                        text=h_label,
-                        h_val=h
-                    ))
-
-    # 5. Humidity Ratio lines - light grey, at 20 gr/lb or 0.002 then 0.004 increments for lb/lb/kg/kg
-    hr_labels = []
-    if show_hr_lines:
-        if USE_SI:
-            # Start at 0.002, then increment by 0.004
-            hr_start = 0.002
-            hr_step = 0.004
-        else:
-            if use_grains:
-                hr_start = 20.0 / 7000.0  # Start at 20 grains/lb
-                hr_step = 20.0 / 7000.0  # Then increment by 20 grains/lb
             else:
+                fig.add_trace(go.Scatter(
+                    x=[db, db],
+                    y=[0, hr_capped * y_scale],
+                    mode='lines',
+                    line=dict(color=chart_primary_line_color, width=0.5),
+                    opacity=0.2,
+                    showlegend=False,
+                    hoverinfo='skip'
+                ))
+    
+        # 2. Wet Bulb lines (every 5°F in both IP and SI) - solid royal blue, finer than DB/RH
+        wb_labels = []
+        WB_LINE_COLOR = "#4169E1"  # Royal blue
+        if show_wb_lines:
+            # 5°F increments in both modes: iterate in °F, convert to chart temp when SI
+            step_degF = 5
+            t_min_F = chart_t_min if not USE_SI else T_MIN * 9.0 / 5.0 + 32.0
+            t_max_F = chart_t_max if not USE_SI else T_MAX * 9.0 / 5.0 + 32.0
+            twb_F_start = int(t_min_F // step_degF) * step_degF
+            twb_F_end = int(t_max_F) - 10
+            for twb_F in range(twb_F_start, twb_F_end + 1, step_degF):
+                if USE_SI:
+                    twb = (twb_F - 32.0) * 5.0 / 9.0  # chart temp in °C
+                    # Round to nearest 5 °C for clean labels (15, 20, 25, 30) like IP
+                    label_text = f'{int(round(twb / 5) * 5)}'
+                else:
+                    twb = float(twb_F)
+                    label_text = f'{twb_F}'
+                tdb_vals = []
+                w_vals = []
+                # WB line starts ON the saturation curve at dry-bulb = wet-bulb (100% RH), then extends right
+                t_start_wb = max(twb, T_MIN)
+                if t_start_wb >= T_MAX:
+                    continue
+                ws_start = get_sat_hr(twb, sat_lookup, P)
+                if ws_start is None:
+                    continue
+                # Start at saturation curve (twb, ws) then draw to T_MAX
+                for tdb in np.arange(t_start_wb, T_MAX + 0.5, 0.5):
+                    try:
+                        w = psychrolib.GetHumRatioFromTWetBulb(tdb, twb, P)
+                    except Exception:
+                        continue
+                    ws = get_sat_hr(tdb, sat_lookup, P)
+                    if ws is None or w is None or w < 0 or w > max_hr or w > ws:
+                        continue
+                    tdb_vals.append(tdb)
+                    w_vals.append(w)
+                # Ensure we include the curve start point so line begins exactly on saturation
+                if len(tdb_vals) == 0 or tdb_vals[0] > twb:
+                    tdb_vals.insert(0, twb)
+                    w_vals.insert(0, ws_start)
+                if len(tdb_vals) > 1:
+                    w_vals_scaled = [w * y_scale for w in w_vals]
+                    fig.add_trace(go.Scatter(
+                        x=tdb_vals,
+                        y=w_vals_scaled,
+                        mode='lines',
+                        line=dict(color=WB_LINE_COLOR, width=0.7),
+                        opacity=0.6,
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+                    # Label just left of saturation curve (small offset so label sits near the line)
+                    twb_int = int(round(twb))
+                    if twb_int >= int(T_MIN) and twb_int <= int(T_MAX):
+                        sat_w = sat_lookup.get(twb_int)
+                        if sat_w is not None:
+                            # Offset by ~1 degree so label is close to the line
+                            offset = 1.0 if (T_MAX - T_MIN) > 50 else 0.5
+                            wb_labels.append({
+                                'x': twb - offset,
+                                'y': sat_w * y_scale,
+                                'text': label_text,
+                                'twb': twb
+                            })
+    
+        # 3. Dew Point lines (every 5°, same grid as WB) - solid green, finer than DB/RH
+        dp_labels = []
+        DP_LINE_COLOR = "green"
+        if show_dp_lines:
+            # Match WB: 5° increments in both IP and SI, aligned to 0s and 5s
+            step_deg = 5
+            if USE_SI:
+                t_min_C = T_MIN
+                t_max_C = T_MAX
+                tdp_start = int(t_min_C // step_deg) * step_deg
+                # Extend to full chart range so DP lines reach top of y-axis (e.g. 40 when chart goes to 40°C)
+                tdp_end = int(t_max_C)
+                for tdp in range(tdp_start, tdp_end + 1, step_deg):
+                    if tdp < 0:
+                        continue
+                    try:
+                        w_dp = psychrolib.GetHumRatioFromTDewPoint(tdp, P)
+                    except Exception:
+                        continue
+                    if w_dp <= 0 or w_dp >= max_hr:
+                        continue
+                    t_left = find_sat_t_for_w(w_dp, T_MIN, T_MAX)
+                    if t_left is None or t_left >= T_MAX:
+                        continue
+                    t_vals = []
+                    w_vals = []
+                    for t in np.arange(t_left, T_MAX + 0.5, 0.5):
+                        t_vals.append(t)
+                        w_vals.append(w_dp)
+                    if len(t_vals) == 0 or t_vals[0] > t_left:
+                        t_vals.insert(0, t_left)
+                        w_vals.insert(0, w_dp)
+                    if len(t_vals) > 1:
+                        w_vals_scaled = [w * y_scale for w in w_vals]
+                        fig.add_trace(go.Scatter(
+                            x=t_vals,
+                            y=w_vals_scaled,
+                            mode='lines',
+                            line=dict(color=DP_LINE_COLOR, width=0.7),
+                            opacity=0.6,
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+                        label_x = T_MAX - (T_MAX - T_MIN) * 0.02
+                        label_y = w_dp * y_scale
+                        # Round to nearest 5 °C for label (15, 20, 25, 30) like WB
+                        dp_labels.append({
+                            'x': label_x,
+                            'y': label_y,
+                            'text': f'{int(round(tdp / 5) * 5)}',
+                            'tdp': tdp
+                        })
+            else:
+                # IP: use °F grid aligned to 5s (same as WB)
+                t_min_F = chart_t_min
+                t_max_F = chart_t_max
+                tdp_F_start = int(t_min_F // step_deg) * step_deg
+                tdp_F_end = int(t_max_F) - 10
+                for tdp_F in range(tdp_F_start, tdp_F_end + 1, step_deg):
+                    tdp = float(tdp_F)
+                    try:
+                        w_dp = psychrolib.GetHumRatioFromTDewPoint(tdp, P)
+                    except Exception:
+                        continue
+                    if w_dp <= 0 or w_dp >= max_hr:
+                        continue
+                    t_left = find_sat_t_for_w(w_dp, T_MIN, T_MAX)
+                    if t_left is None or t_left >= T_MAX:
+                        continue
+                    t_vals = []
+                    w_vals = []
+                    for t in np.arange(t_left, T_MAX + 0.5, 0.5):
+                        t_vals.append(t)
+                        w_vals.append(w_dp)
+                    if len(t_vals) == 0 or t_vals[0] > t_left:
+                        t_vals.insert(0, t_left)
+                        w_vals.insert(0, w_dp)
+                    if len(t_vals) > 1:
+                        w_vals_scaled = [w * y_scale for w in w_vals]
+                        fig.add_trace(go.Scatter(
+                            x=t_vals,
+                            y=w_vals_scaled,
+                            mode='lines',
+                            line=dict(color=DP_LINE_COLOR, width=0.7),
+                            opacity=0.6,
+                            showlegend=False,
+                            hoverinfo='skip'
+                        ))
+                        label_x = T_MAX - (T_MAX - T_MIN) * 0.02
+                        label_y = w_dp * y_scale
+                        dp_labels.append({
+                            'x': label_x,
+                            'y': label_y,
+                            'text': f'{tdp_F}',
+                            'tdp': tdp
+                        })
+    
+        # 4. Enthalpy lines - red/maroon, increments of 10 Btu/lb (IP) or 20 kJ/kg (SI)
+        enthalpy_labels = []
+        if show_enthalpy_lines:
+            try:
+                h_min = psychrolib.GetMoistAirEnthalpy(T_MIN, 0.0)
+            except Exception:
+                h_min = 0.0
+            try:
+                h_max = psychrolib.GetMoistAirEnthalpy(T_MAX, max_hr)
+            except Exception:
+                h_max = h_min + (60000.0 if USE_SI else 60.0)
+            if USE_SI:
+                h_step = 20000.0  # 20 kJ/kg increments
+                h_start = int(np.ceil(h_min / h_step) * h_step)
+                h_end = int(np.floor(h_max / h_step) * h_step)
+            else:
+                h_step = 10.0  # 10 Btu/lb increments
+                h_start = int(np.ceil(h_min / h_step) * h_step)
+                h_end = int(np.floor(h_max / h_step) * h_step)
+            for h in range(int(h_start), int(h_end) + 1, int(h_step)):
+                t_vals = []
+                w_vals = []
+                def w_at_t(t):
+                    try:
+                        return psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t)
+                    except Exception:
+                        return None
+                # Enthalpy line: at low T it's above saturation, at high T below. Find where it crosses into valid region (left boundary).
+                t_intersect = None
+                t_prev_above = None  # last t where line was above saturation
+                for t_test in np.arange(T_MIN, T_MAX + 0.5, 0.5):
+                    try:
+                        w_test = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t_test)
+                    except Exception:
+                        continue
+                    ws_test = get_sat_hr(t_test, sat_lookup, P)
+                    if ws_test is None or w_test is None:
+                        continue
+                    if w_test > ws_test:
+                        # Above saturation (invalid), keep as candidate for left boundary
+                        t_prev_above = t_test
+                        continue
+                    else:
+                        # First point at or below saturation: intersection is between t_prev_above and t_test
+                        if t_prev_above is not None:
+                            hit = find_sat_intersection(t_prev_above, t_test, w_at_t)
+                            if hit:
+                                t_intersect = hit[0]
+                        else:
+                            # Line already valid at T_MIN, start from T_MIN
+                            t_intersect = T_MIN
+                        break
+                if t_intersect is None:
+                    continue
+                # Draw from intersection point to T_MAX (right side of saturation curve)
+                for t in np.arange(t_intersect, T_MAX + 0.5, 0.5):
+                    try:
+                        w = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(h, t)
+                    except Exception:
+                        continue
+                    ws = get_sat_hr(t, sat_lookup, P)
+                    if ws is None or w is None or w < 0 or w > max_hr or w > ws:
+                        continue
+                    t_vals.append(t)
+                    w_vals.append(w)
+                # Add intersection point at start if not already included
+                if len(t_vals) == 0 or t_vals[0] > t_intersect:
+                    ws_int = get_sat_hr(t_intersect, sat_lookup, P)
+                    if ws_int is not None:
+                        t_vals.insert(0, t_intersect)
+                        w_vals.insert(0, ws_int)
+                if len(t_vals) > 1:
+                    w_vals_scaled = [w * y_scale for w in w_vals]
+                    fig.add_trace(go.Scatter(
+                        x=t_vals,
+                        y=w_vals_scaled,
+                        mode='lines',
+                        line=dict(color='#8B0000', width=1),  # Dark red/maroon
+                        opacity=0.6,
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+                    # Label near left third of line
+                    label_idx = max(0, len(t_vals) // 3)
+                    if label_idx < len(t_vals) and label_idx < len(w_vals_scaled):
+                        h_label = f"{int(h/1000)}" if USE_SI else f"{int(h)}"
+                        enthalpy_labels.append(dict(
+                            x=t_vals[label_idx],
+                            y=w_vals_scaled[label_idx],
+                            text=h_label,
+                            h_val=h
+                        ))
+    
+        # 5. Humidity Ratio lines - light grey, at 20 gr/lb or 0.002 then 0.004 increments for lb/lb/kg/kg
+        hr_labels = []
+        if show_hr_lines:
+            if USE_SI:
                 # Start at 0.002, then increment by 0.004
                 hr_start = 0.002
                 hr_step = 0.004
-        # First line at hr_start, then add hr_step for each subsequent line
-        w = hr_start
-        while w <= max_hr:
-            t_left = find_sat_t_for_w(w, T_MIN, T_MAX)
-            if t_left is None or t_left >= T_MAX:
-                w += hr_step
-                continue
-            t_vals = []
-            w_vals = []
-            for t in np.arange(max(T_MIN, t_left), T_MAX + 0.5, 0.5):
-                ws = get_sat_hr(t, sat_lookup, P)
-                if ws is None or w > ws:
+            else:
+                if use_grains:
+                    hr_start = 20.0 / 7000.0  # Start at 20 grains/lb
+                    hr_step = 20.0 / 7000.0  # Then increment by 20 grains/lb
+                else:
+                    # Start at 0.002, then increment by 0.004
+                    hr_start = 0.002
+                    hr_step = 0.004
+            # First line at hr_start, then add hr_step for each subsequent line
+            w = hr_start
+            while w <= max_hr:
+                t_left = find_sat_t_for_w(w, T_MIN, T_MAX)
+                if t_left is None or t_left >= T_MAX:
+                    w += hr_step
                     continue
-                t_vals.append(t)
-                w_vals.append(w)
-            if t_left >= T_MIN and (not t_vals or t_vals[0] > t_left):
-                t_vals.insert(0, t_left)
-                w_vals.insert(0, w)
-            if len(t_vals) > 1:
-                w_vals_scaled = [w * y_scale for w in w_vals]
-                fig.add_trace(go.Scatter(
-                    x=t_vals,
-                    y=w_vals_scaled,
-                    mode='lines',
-                    line=dict(color='lightgray', width=0.8),
-                    showlegend=False,
-                    hoverinfo='skip'
-                ))
-                # Store HR value for Y-axis tick labels (not annotations in chart)
-                hr_labels.append({
-                    'w': w,
-                    'y_scaled': w * y_scale
-                })
-            # Increment for next line
-            w += hr_step
-
-    # 6. Plot minor RH lines (10% increments) as primary guides (trim at saturation)
-    rh_annotations = []
-    for rh in range(10, 100, 10):
-        rh_temps, rh_hr = get_rh_curve(rh, T_MIN, T_MAX, P)
-        def w_at_t_rh(t):
-            try:
-                return psychrolib.GetHumRatioFromRelHum(t, rh / 100.0, P)
-            except Exception:
-                return None
-        # Find intersection point where RH curve meets saturation (left boundary)
-        trim_temps = []
-        trim_hr = []
-        t_intersect = None
-        for i in range(len(rh_temps)):
-            if rh_hr[i] is None:
-                continue
-            ws_i = get_sat_hr(rh_temps[i], sat_lookup, P)
-            if ws_i is None:
-                continue
-            if rh_hr[i] <= ws_i:
-                # Still below/at saturation, check next point
-                continue
-            else:
-                # Crossed saturation, find exact intersection
-                t_lo = rh_temps[i - 1] if i > 0 else T_MIN
-                hit = find_sat_intersection(t_lo, rh_temps[i], w_at_t_rh)
-                if hit:
-                    t_intersect = hit[0]
-                break
-        if t_intersect is None:
-            # No intersection found, use all points (shouldn't happen normally)
-            trim_temps = list(rh_temps)
-            trim_hr = list(rh_hr)
-        else:
-            # Keep only points from intersection to T_MAX (right side of saturation curve)
+                t_vals = []
+                w_vals = []
+                for t in np.arange(max(T_MIN, t_left), T_MAX + 0.5, 0.5):
+                    ws = get_sat_hr(t, sat_lookup, P)
+                    if ws is None or w > ws:
+                        continue
+                    t_vals.append(t)
+                    w_vals.append(w)
+                if t_left >= T_MIN and (not t_vals or t_vals[0] > t_left):
+                    t_vals.insert(0, t_left)
+                    w_vals.insert(0, w)
+                if len(t_vals) > 1:
+                    w_vals_scaled = [w * y_scale for w in w_vals]
+                    fig.add_trace(go.Scatter(
+                        x=t_vals,
+                        y=w_vals_scaled,
+                        mode='lines',
+                        line=dict(color='lightgray', width=0.8),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    ))
+                    # Store HR value for Y-axis tick labels (not annotations in chart)
+                    hr_labels.append({
+                        'w': w,
+                        'y_scaled': w * y_scale
+                    })
+                # Increment for next line
+                w += hr_step
+    
+        # 6. Plot minor RH lines (10% increments) as primary guides (trim at saturation)
+        rh_annotations = []
+        for rh in range(10, 100, 10):
+            rh_temps, rh_hr = get_rh_curve(rh, T_MIN, T_MAX, P)
+            def w_at_t_rh(t):
+                try:
+                    return psychrolib.GetHumRatioFromRelHum(t, rh / 100.0, P)
+                except Exception:
+                    return None
+            # Find intersection point where RH curve meets saturation (left boundary)
+            trim_temps = []
+            trim_hr = []
+            t_intersect = None
             for i in range(len(rh_temps)):
-                if rh_temps[i] >= t_intersect and rh_hr[i] is not None:
-                    ws_i = get_sat_hr(rh_temps[i], sat_lookup, P)
-                    if ws_i is not None and rh_hr[i] <= ws_i:
-                        trim_temps.append(rh_temps[i])
-                        trim_hr.append(rh_hr[i])
-            # Add intersection point at start if not already included
-            if len(trim_temps) == 0 or trim_temps[0] > t_intersect:
-                ws_int = get_sat_hr(t_intersect, sat_lookup, P)
-                if ws_int is not None:
-                    trim_temps.insert(0, t_intersect)
-                    trim_hr.insert(0, ws_int)
-        rh_hr_scaled = [min(hr, max_hr) * y_scale if hr is not None else None for hr in trim_hr]
-        fig.add_trace(go.Scatter(
-            x=trim_temps,
-            y=rh_hr_scaled,
-            mode='lines',
-            name=f'{rh}% RH',
-            line=dict(color=chart_primary_line_color, width=1),
-            opacity=0.55,
-            showlegend=False,
-            hoverinfo='skip'
-        ))
-        n_pts = len(trim_temps)
-        idx = min(int(n_pts * 0.75), n_pts - 1)
-        while idx >= 0 and (rh_hr_scaled[idx] is None or rh_hr_scaled[idx] <= 0):
-            idx -= 1
-        if idx >= 0 and rh_hr_scaled[idx] is not None:
-            rh_annotations.append(dict(
-                x=trim_temps[idx],
-                y=rh_hr_scaled[idx],
-                text=f"{rh}%",
-                showarrow=False,
-                xref="x",
-                yref="y",
-                font=dict(size=9, color=chart_annotation_font_color),
-                bgcolor=chart_annotation_bg,
-                bordercolor="rgba(0,0,0,0)",
-                borderwidth=0,
-                borderpad=0,
-            ))
-
-    # 7. Plot Saturation Curve (100% RH) on top of minor lines
-    sat_hr_scaled = [min(hr, max_hr) * y_scale if hr is not None else None for hr in sat_hr]
-    fig.add_trace(go.Scatter(
-        x=sat_temps,
-        y=sat_hr_scaled,
-        mode='lines',
-        name='Saturation Line (100% RH)',
-        line=dict(color=chart_primary_line_color, width=2)
-    ))
-
-    # Legend-only traces for Wet Bulb, Dew Point, Enthalpy, and HR Grid
-    if show_wb_lines:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='lines',
-            line=dict(color=WB_LINE_COLOR, width=0.7),
-            name='Wet Bulb',
-            showlegend=True,
-        ))
-    if show_dp_lines:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='lines',
-            line=dict(color=DP_LINE_COLOR, width=0.7),
-            name='Dew Point',
-            showlegend=True,
-        ))
-    if show_enthalpy_lines:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='lines',
-            line=dict(color='#8B0000', width=1),
-            name='Enthalpy' + (" (kJ/kg)" if USE_SI else " (Btu/lb)"),
-            showlegend=True,
-        ))
-    if show_hr_lines:
-        fig.add_trace(go.Scatter(
-            x=[None], y=[None], mode='lines',
-            line=dict(color='lightgray', width=0.8),
-            name='Humidity Ratio',
-            showlegend=True,
-        ))
-
-    # Add Wet Bulb labels: to the left of saturation curve
-    wb_annotations = []
-    if show_wb_lines:
-        for label in wb_labels:
-            wb_annotations.append(dict(
-                x=label['x'],
-                y=label['y'],
-                text=label['text'],
-                showarrow=False,
-                xref="x",
-                yref="y",
-                xanchor="right",
-                yanchor="middle",
-                font=dict(size=9, color=chart_annotation_font_color),
-                bgcolor=chart_annotation_bg,
-                bordercolor="rgba(0,0,0,0)",
-                borderwidth=0,
-                borderpad=2,
-            ))
-
-    # Add Dew Point labels: to the right of y-axis
-    dp_annotations = []
-    if show_dp_lines:
-        for label in dp_labels:
-            dp_annotations.append(dict(
-                x=label['x'],
-                y=label['y'],
-                text=label['text'],
-                showarrow=False,
-                xref="x",
-                yref="y",
-                xanchor="left",
-                yanchor="middle",
-                font=dict(size=9, color=chart_annotation_font_color),
-                bgcolor=chart_annotation_bg,
-                bordercolor="rgba(0,0,0,0)",
-                borderwidth=0,
-                borderpad=2,
-            ))
-
-    # Add Enthalpy labels
-    enthalpy_annotations = []
-    if show_enthalpy_lines and len(enthalpy_labels) > 0:
-        for label in enthalpy_labels:
-            enthalpy_annotations.append(dict(
-                x=label['x'],
-                y=label['y'],
-                text=label['text'],
-                showarrow=False,
-                xref="x",
-                yref="y",
-                xanchor="right",
-                yanchor="middle",
-                font=dict(size=9, color=chart_annotation_font_color),
-                bgcolor=chart_annotation_bg,
-                bordercolor="rgba(0,0,0,0)",
-                borderwidth=0,
-                borderpad=2,
-            ))
-
-    # Add property labels as traces (not layout annotations) so state points can be drawn on top
-    def _textposition_from_anchor(xanchor, yanchor):
-        ypos = "top" if yanchor == "bottom" else ("bottom" if yanchor == "top" else "middle")
-        xpos = "left" if xanchor == "left" else ("right" if xanchor == "right" else "center")
-        return f"{ypos} {xpos}" if ypos != "middle" else f"middle {xpos}"
-    all_label_annotations = wb_annotations + dp_annotations + enthalpy_annotations + rh_annotations
-    for ann in all_label_annotations:
-        textpos = _textposition_from_anchor(ann.get("xanchor", "center"), ann.get("yanchor", "middle"))
-        fig.add_trace(go.Scatter(
-            x=[ann["x"]],
-            y=[ann["y"]],
-            mode="text",
-            text=[ann["text"]],
-            textposition=textpos,
-            textfont=ann.get("font", dict(size=9, color=chart_annotation_font_color)),
-            showlegend=False,
-            hoverinfo="skip",
-        ))
-
-    # 8. Hover tooltip grid: build data and add trace so hovering anywhere shows DB, HR, RH, WB, DP, h
-    grid_x = np.linspace(T_MIN, T_MAX, 150)
-    grid_y = np.linspace(0, max_hr, 100)
-    gx, gy = np.meshgrid(grid_x, grid_y)
-    gx = gx.ravel()
-    gy = gy.ravel()
-    grid_customdata = []
-    valid_x = []
-    valid_y = []
-    for x, y_hr in zip(gx, gy):
-        props = calculate_properties_from_db_hr(x, y_hr, P, sat_lookup)
-        if props is not None:
-            hr_display_val = (props[KEY_HR] * 7000.0 if use_grains else props[KEY_HR]) if not USE_SI else props[KEY_HR]
-            grid_customdata.append([
-                props[KEY_DB],
-                hr_display_val,
-                props[KEY_RH],
-                props[KEY_WB],
-                props[KEY_DP],
-                props[KEY_ENTH],
-            ])
-            valid_x.append(x)
-            valid_y.append(y_hr * y_scale)
-
-    cycle_arrow_annotations = []
-    # 9. Plot User State Point(s) (if solved)
-    if mode == "Single State Point" and results_1 is not None:
-        results = results_1
-        hr_value = results[KEY_HR]
-        hr_display_value = (hr_value * 7000.0 if use_grains else hr_value) if not USE_SI else hr_value
-        hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
-        state_customdata = [[
-            results[KEY_DB],
-            hr_display_value,
-            results[KEY_RH],
-            results[KEY_WB],
-            results[KEY_DP],
-            results[KEY_ENTH],
-        ]]
-        hover_tmpl = (
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        # Visible red state point
-        fig.add_trace(go.Scatter(
-            x=[results[KEY_DB]],
-            y=[hr_value * y_scale],
-            mode='markers+text',
-            name='Current State',
-            showlegend=False,
-            text=['State Point'],
-            textposition="top center",
-            marker=dict(size=12, color='red', symbol='x'),
-            customdata=state_customdata,
-            hovertemplate=hover_tmpl,
-            hoverlabel=dict(
-                bgcolor="#ffcccc" if not is_dark else "rgba(80,40,40,0.98)",
-                font_color=hover_font_color,
-            ),
-        ))
-    
-    # Process mode: Plot both points
-    elif mode == "Process" and results_1 is not None and results_2 is not None:
-        hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
-        # Point 1
-        hr_value_1 = results_1[KEY_HR]
-        hr_display_value_1 = (hr_value_1 * 7000.0 if use_grains else hr_value_1) if not USE_SI else hr_value_1
-        state_customdata_1 = [[
-            results_1[KEY_DB],
-            hr_display_value_1,
-            results_1[KEY_RH],
-            results_1[KEY_WB],
-            results_1[KEY_DP],
-            results_1[KEY_ENTH],
-        ]]
-        hover_tmpl_1 = (
-            "Point 1<br>"
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        
-        fig.add_trace(go.Scatter(
-            x=[results_1[KEY_DB]],
-            y=[hr_value_1 * y_scale],
-            mode='markers+text',
-            name='Point 1',
-            showlegend=False,
-            text=['Point 1'],
-            textposition="top center",
-            marker=dict(size=12, color='blue', symbol='circle'),
-            customdata=state_customdata_1,
-            hovertemplate=hover_tmpl_1,
-            hoverlabel=dict(
-                bgcolor="#ccccff",
-                font_color=hover_font_color,
-            ),
-        ))
-        
-        # Point 2
-        hr_value_2 = results_2[KEY_HR]
-        hr_display_value_2 = (hr_value_2 * 7000.0 if use_grains else hr_value_2) if not USE_SI else hr_value_2
-        state_customdata_2 = [[
-            results_2[KEY_DB],
-            hr_display_value_2,
-            results_2[KEY_RH],
-            results_2[KEY_WB],
-            results_2[KEY_DP],
-            results_2[KEY_ENTH],
-        ]]
-        hover_tmpl_2 = (
-            "Point 2<br>"
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        
-        fig.add_trace(go.Scatter(
-            x=[results_2[KEY_DB]],
-            y=[hr_value_2 * y_scale],
-            mode='markers+text',
-            name='Point 2',
-            showlegend=False,
-            text=['Point 2'],
-            textposition="top center",
-            marker=dict(size=12, color='green', symbol='square'),
-            customdata=state_customdata_2,
-            hovertemplate=hover_tmpl_2,
-            hoverlabel=dict(
-                bgcolor="#ccffcc",
-                font_color=hover_font_color,
-            ),
-        ))
-        
-        # Draw line connecting the two points
-        fig.add_trace(go.Scatter(
-            x=[results_1[KEY_DB], results_2[KEY_DB]],
-            y=[hr_value_1 * y_scale, hr_value_2 * y_scale],
-            mode='lines',
-            name='Process Line',
-            showlegend=False,
-            line=dict(color='gray', width=2, dash='dash'),
-            hoverinfo='skip',
-        ))
-        
-        results = None  # Not used in process mode
-    
-    # Air Mixing mode: Plot Point 1, Point 2, and Mixed Air
-    elif mode == "Air Mixing" and results_1 is not None and results_2 is not None:
-        # Recalculate mixed air based on current unit system (don't use stored results_mix)
-        airflow_1_chart = st.session_state.get("airflow_1", 0.0)
-        airflow_type_1_chart = st.session_state.get("airflow_type_1", "ACFM")
-        airflow_2_chart = st.session_state.get("airflow_2", 0.0)
-        airflow_type_2_chart = st.session_state.get("airflow_type_2", "ACFM")
-        
-        # Calculate mass flows
-        def _calc_mass_flow_chart(airflow_val, airflow_type, results_dict):
-            if results_dict is None or KEY_DENS not in results_dict:
-                return None
-            if USE_SI:
-                return airflow_val * results_dict[KEY_DENS] / 3600.0  # kg/s
+                if rh_hr[i] is None:
+                    continue
+                ws_i = get_sat_hr(rh_temps[i], sat_lookup, P)
+                if ws_i is None:
+                    continue
+                if rh_hr[i] <= ws_i:
+                    # Still below/at saturation, check next point
+                    continue
+                else:
+                    # Crossed saturation, find exact intersection
+                    t_lo = rh_temps[i - 1] if i > 0 else T_MIN
+                    hit = find_sat_intersection(t_lo, rh_temps[i], w_at_t_rh)
+                    if hit:
+                        t_intersect = hit[0]
+                    break
+            if t_intersect is None:
+                # No intersection found, use all points (shouldn't happen normally)
+                trim_temps = list(rh_temps)
+                trim_hr = list(rh_hr)
             else:
-                if airflow_type == "ACFM":
-                    return airflow_val * results_dict[KEY_DENS]  # lb/min
-                else:  # SCFM
-                    return airflow_val * 0.075  # lb/min
-        
-        mass_flow_1_chart = _calc_mass_flow_chart(airflow_1_chart, airflow_type_1_chart, results_1)
-        mass_flow_2_chart = _calc_mass_flow_chart(airflow_2_chart, airflow_type_2_chart, results_2)
-        
-        # Calculate Mixed Air state
-        results_mix = None
-        if mass_flow_1_chart is not None and mass_flow_2_chart is not None and (mass_flow_1_chart + mass_flow_2_chart) > 0:
-            # Mass-weighted mixing
-            h_mix = (mass_flow_1_chart * results_1[KEY_ENTH] + mass_flow_2_chart * results_2[KEY_ENTH]) / (mass_flow_1_chart + mass_flow_2_chart)
-            w_mix = (mass_flow_1_chart * results_1[KEY_HR] + mass_flow_2_chart * results_2[KEY_HR]) / (mass_flow_1_chart + mass_flow_2_chart)
-            
-            # Solve for mixed air state from h_mix and w_mix
-            chart_t_min_val = st.session_state.get("chart_t_min", DEFAULT_CHART_MIN_F)
-            chart_t_max_val = st.session_state.get("chart_t_max", DEFAULT_CHART_MAX_F)
-            t_min_solve_mix = (chart_t_min_val - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min_val
-            t_max_solve_mix = (chart_t_max_val - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max_val
-            try:
-                results_mix = solve_state_from_enthalpy_humratio(
-                    h_mix, w_mix, PRESSURE, t_min_solve_mix, t_max_solve_mix
-                )
-            except Exception:
-                results_mix = None
-        
-        hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
-        # Point 1
-        hr_value_1 = results_1[KEY_HR]
-        hr_display_value_1 = (hr_value_1 * 7000.0 if use_grains else hr_value_1) if not USE_SI else hr_value_1
-        state_customdata_1 = [[
-            results_1[KEY_DB],
-            hr_display_value_1,
-            results_1[KEY_RH],
-            results_1[KEY_WB],
-            results_1[KEY_DP],
-            results_1[KEY_ENTH],
-        ]]
-        hover_tmpl_1 = (
-            "Point 1<br>"
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        
+                # Keep only points from intersection to T_MAX (right side of saturation curve)
+                for i in range(len(rh_temps)):
+                    if rh_temps[i] >= t_intersect and rh_hr[i] is not None:
+                        ws_i = get_sat_hr(rh_temps[i], sat_lookup, P)
+                        if ws_i is not None and rh_hr[i] <= ws_i:
+                            trim_temps.append(rh_temps[i])
+                            trim_hr.append(rh_hr[i])
+                # Add intersection point at start if not already included
+                if len(trim_temps) == 0 or trim_temps[0] > t_intersect:
+                    ws_int = get_sat_hr(t_intersect, sat_lookup, P)
+                    if ws_int is not None:
+                        trim_temps.insert(0, t_intersect)
+                        trim_hr.insert(0, ws_int)
+            rh_hr_scaled = [min(hr, max_hr) * y_scale if hr is not None else None for hr in trim_hr]
+            fig.add_trace(go.Scatter(
+                x=trim_temps,
+                y=rh_hr_scaled,
+                mode='lines',
+                name=f'{rh}% RH',
+                line=dict(color=chart_primary_line_color, width=1),
+                opacity=0.55,
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+            n_pts = len(trim_temps)
+            idx = min(int(n_pts * 0.75), n_pts - 1)
+            while idx >= 0 and (rh_hr_scaled[idx] is None or rh_hr_scaled[idx] <= 0):
+                idx -= 1
+            if idx >= 0 and rh_hr_scaled[idx] is not None:
+                rh_annotations.append(dict(
+                    x=trim_temps[idx],
+                    y=rh_hr_scaled[idx],
+                    text=f"{rh}%",
+                    showarrow=False,
+                    xref="x",
+                    yref="y",
+                    font=dict(size=9, color=chart_annotation_font_color),
+                    bgcolor=chart_annotation_bg,
+                    bordercolor="rgba(0,0,0,0)",
+                    borderwidth=0,
+                    borderpad=0,
+                ))
+    
+        # 7. Plot Saturation Curve (100% RH) on top of minor lines
+        sat_hr_scaled = [min(hr, max_hr) * y_scale if hr is not None else None for hr in sat_hr]
         fig.add_trace(go.Scatter(
-            x=[results_1[KEY_DB]],
-            y=[hr_value_1 * y_scale],
-            mode='markers+text',
-            name='Point 1',
-            showlegend=False,
-            text=['Point 1'],
-            textposition="top center",
-            marker=dict(size=12, color='blue', symbol='circle'),
-            customdata=state_customdata_1,
-            hovertemplate=hover_tmpl_1,
-            hoverlabel=dict(
-                bgcolor="#ccccff",
-                font_color=hover_font_color,
-            ),
+            x=sat_temps,
+            y=sat_hr_scaled,
+            mode='lines',
+            name='Saturation Line (100% RH)',
+            line=dict(color=chart_primary_line_color, width=2)
         ))
-        
-        # Point 2
-        hr_value_2 = results_2[KEY_HR]
-        hr_display_value_2 = (hr_value_2 * 7000.0 if use_grains else hr_value_2) if not USE_SI else hr_value_2
-        state_customdata_2 = [[
-            results_2[KEY_DB],
-            hr_display_value_2,
-            results_2[KEY_RH],
-            results_2[KEY_WB],
-            results_2[KEY_DP],
-            results_2[KEY_ENTH],
-        ]]
-        hover_tmpl_2 = (
-            "Point 2<br>"
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        
-        fig.add_trace(go.Scatter(
-            x=[results_2[KEY_DB]],
-            y=[hr_value_2 * y_scale],
-            mode='markers+text',
-            name='Point 2',
-            showlegend=False,
-            text=['Point 2'],
-            textposition="top center",
-            marker=dict(size=12, color='green', symbol='square'),
-            customdata=state_customdata_2,
-            hovertemplate=hover_tmpl_2,
-            hoverlabel=dict(
-                bgcolor="#ccffcc",
-                font_color=hover_font_color,
-            ),
-        ))
-        
-        # Mixed Air Point (if calculated)
-        if results_mix is not None:
-            hr_value_mix = results_mix[KEY_HR]
-            hr_display_value_mix = (hr_value_mix * 7000.0 if use_grains else hr_value_mix) if not USE_SI else hr_value_mix
-            state_customdata_mix = [[
-                results_mix[KEY_DB],
-                hr_display_value_mix,
-                results_mix[KEY_RH],
-                results_mix[KEY_WB],
-                results_mix[KEY_DP],
-                results_mix[KEY_ENTH],
+    
+        # Legend-only traces for Wet Bulb, Dew Point, Enthalpy, and HR Grid
+        if show_wb_lines:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color=WB_LINE_COLOR, width=0.7),
+                name='Wet Bulb',
+                showlegend=True,
+            ))
+        if show_dp_lines:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color=DP_LINE_COLOR, width=0.7),
+                name='Dew Point',
+                showlegend=True,
+            ))
+        if show_enthalpy_lines:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color='#8B0000', width=1),
+                name='Enthalpy' + (" (kJ/kg)" if USE_SI else " (Btu/lb)"),
+                showlegend=True,
+            ))
+        if show_hr_lines:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode='lines',
+                line=dict(color='lightgray', width=0.8),
+                name='Humidity Ratio',
+                showlegend=True,
+            ))
+    
+        # Add Wet Bulb labels: to the left of saturation curve
+        wb_annotations = []
+        if show_wb_lines:
+            for label in wb_labels:
+                wb_annotations.append(dict(
+                    x=label['x'],
+                    y=label['y'],
+                    text=label['text'],
+                    showarrow=False,
+                    xref="x",
+                    yref="y",
+                    xanchor="right",
+                    yanchor="middle",
+                    font=dict(size=9, color=chart_annotation_font_color),
+                    bgcolor=chart_annotation_bg,
+                    bordercolor="rgba(0,0,0,0)",
+                    borderwidth=0,
+                    borderpad=2,
+                ))
+    
+        # Add Dew Point labels: to the right of y-axis
+        dp_annotations = []
+        if show_dp_lines:
+            for label in dp_labels:
+                dp_annotations.append(dict(
+                    x=label['x'],
+                    y=label['y'],
+                    text=label['text'],
+                    showarrow=False,
+                    xref="x",
+                    yref="y",
+                    xanchor="left",
+                    yanchor="middle",
+                    font=dict(size=9, color=chart_annotation_font_color),
+                    bgcolor=chart_annotation_bg,
+                    bordercolor="rgba(0,0,0,0)",
+                    borderwidth=0,
+                    borderpad=2,
+                ))
+    
+        # Add Enthalpy labels
+        enthalpy_annotations = []
+        if show_enthalpy_lines and len(enthalpy_labels) > 0:
+            for label in enthalpy_labels:
+                enthalpy_annotations.append(dict(
+                    x=label['x'],
+                    y=label['y'],
+                    text=label['text'],
+                    showarrow=False,
+                    xref="x",
+                    yref="y",
+                    xanchor="right",
+                    yanchor="middle",
+                    font=dict(size=9, color=chart_annotation_font_color),
+                    bgcolor=chart_annotation_bg,
+                    bordercolor="rgba(0,0,0,0)",
+                    borderwidth=0,
+                    borderpad=2,
+                ))
+    
+        # Add property labels as traces (not layout annotations) so state points can be drawn on top
+        def _textposition_from_anchor(xanchor, yanchor):
+            ypos = "top" if yanchor == "bottom" else ("bottom" if yanchor == "top" else "middle")
+            xpos = "left" if xanchor == "left" else ("right" if xanchor == "right" else "center")
+            return f"{ypos} {xpos}" if ypos != "middle" else f"middle {xpos}"
+        all_label_annotations = wb_annotations + dp_annotations + enthalpy_annotations + rh_annotations
+        for ann in all_label_annotations:
+            textpos = _textposition_from_anchor(ann.get("xanchor", "center"), ann.get("yanchor", "middle"))
+            fig.add_trace(go.Scatter(
+                x=[ann["x"]],
+                y=[ann["y"]],
+                mode="text",
+                text=[ann["text"]],
+                textposition=textpos,
+                textfont=ann.get("font", dict(size=9, color=chart_annotation_font_color)),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+    
+        # 8. Hover tooltip grid: build data and add trace so hovering anywhere shows DB, HR, RH, WB, DP, h
+        grid_x = np.linspace(T_MIN, T_MAX, 150)
+        grid_y = np.linspace(0, max_hr, 100)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+        gx = gx.ravel()
+        gy = gy.ravel()
+        grid_customdata = []
+        valid_x = []
+        valid_y = []
+        for x, y_hr in zip(gx, gy):
+            props = calculate_properties_from_db_hr(x, y_hr, P, sat_lookup)
+            if props is not None:
+                hr_display_val = (props[KEY_HR] * 7000.0 if use_grains else props[KEY_HR]) if not USE_SI else props[KEY_HR]
+                grid_customdata.append([
+                    props[KEY_DB],
+                    hr_display_val,
+                    props[KEY_RH],
+                    props[KEY_WB],
+                    props[KEY_DP],
+                    props[KEY_ENTH],
+                ])
+                valid_x.append(x)
+                valid_y.append(y_hr * y_scale)
+    
+        cycle_arrow_annotations = []
+        # 9. Plot User State Point(s) (if solved)
+        if mode == "Single State Point" and results_1 is not None:
+            results = results_1
+            hr_value = results[KEY_HR]
+            hr_display_value = (hr_value * 7000.0 if use_grains else hr_value) if not USE_SI else hr_value
+            hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
+            state_customdata = [[
+                results[KEY_DB],
+                hr_display_value,
+                results[KEY_RH],
+                results[KEY_WB],
+                results[KEY_DP],
+                results[KEY_ENTH],
             ]]
-            hover_tmpl_mix = (
-                "Mixed Air<br>"
+            hover_tmpl = (
+                f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                "RH: %{customdata[2]:.2f} %<br>"
+                f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                "<extra></extra>"
+            )
+            # Visible red state point
+            fig.add_trace(go.Scatter(
+                x=[results[KEY_DB]],
+                y=[hr_value * y_scale],
+                mode='markers+text',
+                name='Current State',
+                showlegend=False,
+                text=['State Point'],
+                textposition="top center",
+                marker=dict(size=12, color='red', symbol='x'),
+                customdata=state_customdata,
+                hovertemplate=hover_tmpl,
+                hoverlabel=dict(
+                    bgcolor="#ffcccc" if not is_dark else "rgba(80,40,40,0.98)",
+                    font_color=hover_font_color,
+                ),
+            ))
+        
+        # Process mode: Plot both points
+        elif mode == "Process" and results_1 is not None and results_2 is not None:
+            hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
+            # Point 1
+            hr_value_1 = results_1[KEY_HR]
+            hr_display_value_1 = (hr_value_1 * 7000.0 if use_grains else hr_value_1) if not USE_SI else hr_value_1
+            state_customdata_1 = [[
+                results_1[KEY_DB],
+                hr_display_value_1,
+                results_1[KEY_RH],
+                results_1[KEY_WB],
+                results_1[KEY_DP],
+                results_1[KEY_ENTH],
+            ]]
+            hover_tmpl_1 = (
+                "Point 1<br>"
                 f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
                 f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
                 "RH: %{customdata[2]:.2f} %<br>"
@@ -1926,393 +1901,646 @@ with col2:
             )
             
             fig.add_trace(go.Scatter(
-                x=[results_mix[KEY_DB]],
-                y=[hr_value_mix * y_scale],
+                x=[results_1[KEY_DB]],
+                y=[hr_value_1 * y_scale],
                 mode='markers+text',
-                name='Mixed Air',
+                name='Point 1',
                 showlegend=False,
-                text=['Mixed Air'],
+                text=['Point 1'],
                 textposition="top center",
-                marker=dict(size=12, color='orange', symbol='diamond'),
-                customdata=state_customdata_mix,
-                hovertemplate=hover_tmpl_mix,
+                marker=dict(size=12, color='blue', symbol='circle'),
+                customdata=state_customdata_1,
+                hovertemplate=hover_tmpl_1,
                 hoverlabel=dict(
-                    bgcolor="#ffddcc",
+                    bgcolor="#ccccff",
                     font_color=hover_font_color,
                 ),
             ))
+            
+            # Point 2
+            hr_value_2 = results_2[KEY_HR]
+            hr_display_value_2 = (hr_value_2 * 7000.0 if use_grains else hr_value_2) if not USE_SI else hr_value_2
+            state_customdata_2 = [[
+                results_2[KEY_DB],
+                hr_display_value_2,
+                results_2[KEY_RH],
+                results_2[KEY_WB],
+                results_2[KEY_DP],
+                results_2[KEY_ENTH],
+            ]]
+            hover_tmpl_2 = (
+                "Point 2<br>"
+                f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                "RH: %{customdata[2]:.2f} %<br>"
+                f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                "<extra></extra>"
+            )
+            
+            fig.add_trace(go.Scatter(
+                x=[results_2[KEY_DB]],
+                y=[hr_value_2 * y_scale],
+                mode='markers+text',
+                name='Point 2',
+                showlegend=False,
+                text=['Point 2'],
+                textposition="top center",
+                marker=dict(size=12, color='green', symbol='square'),
+                customdata=state_customdata_2,
+                hovertemplate=hover_tmpl_2,
+                hoverlabel=dict(
+                    bgcolor="#ccffcc",
+                    font_color=hover_font_color,
+                ),
+            ))
+            
+            # Draw line connecting the two points
+            fig.add_trace(go.Scatter(
+                x=[results_1[KEY_DB], results_2[KEY_DB]],
+                y=[hr_value_1 * y_scale, hr_value_2 * y_scale],
+                mode='lines',
+                name='Process Line',
+                showlegend=False,
+                line=dict(color='gray', width=2, dash='dash'),
+                hoverinfo='skip',
+            ))
+            
+            results = None  # Not used in process mode
         
-        # Draw line connecting Point 1 and Point 2 (Mixed Air should lie on this line)
-        fig.add_trace(go.Scatter(
-            x=[results_1[KEY_DB], results_2[KEY_DB]],
-            y=[hr_value_1 * y_scale, hr_value_2 * y_scale],
-            mode='lines',
-            name='Mixing Line',
-            showlegend=False,
-            line=dict(color='gray', width=2, dash='dash'),
-            hoverinfo='skip',
-        ))
-        
-        results = None  # Not used in mixing mode
-
-    elif mode == "Cycle Analysis":
-        results_ra = st.session_state.get("cycle_ra")
-        results_oa = st.session_state.get("cycle_oa")
-        results_ma = st.session_state.get("cycle_ma")
-        cycle_points = st.session_state.get("cycle_points", [])
-        pct_oa = st.session_state.get("cycle_pct_oa", 20.0)
-        if results_ma is not None:
-            hr_ra = (results_ra[KEY_HR] * y_scale) if results_ra is not None else None
-            hr_oa = (results_oa[KEY_HR] * y_scale) if results_oa is not None else None
-            hr_ma = results_ma[KEY_HR] * y_scale
-            # 100% OA: only OA visible; OA is the start of the chain. 0% OA: only RA visible; RA is the start.
-            if pct_oa >= 99.5:
-                pts_x = [results_oa[KEY_DB]]
-                pts_y = [hr_oa]
-                for pt in cycle_points:
-                    pts_x.append(pt["state"][KEY_DB])
-                    pts_y.append(pt["state"][KEY_HR] * y_scale)
-                if len(pts_x) > 1:
-                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
-                fig.add_trace(go.Scatter(
-                    x=[results_oa[KEY_DB]], y=[hr_oa],
-                    mode='markers+text', text=['Outside Air'], textposition='top center',
-                    marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
-                ))
-            elif pct_oa <= 0.5:
-                pts_x = [results_ra[KEY_DB]]
-                pts_y = [hr_ra]
-                for pt in cycle_points:
-                    pts_x.append(pt["state"][KEY_DB])
-                    pts_y.append(pt["state"][KEY_HR] * y_scale)
-                if len(pts_x) > 1:
-                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
-                fig.add_trace(go.Scatter(
-                    x=[results_ra[KEY_DB]], y=[hr_ra],
-                    mode='markers+text', text=['Return Air'], textposition='top center',
-                    marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
-                ))
-            else:
-                # Mixed: show RA, OA, MA and mixing lines
-                fig.add_trace(go.Scatter(
-                    x=[results_oa[KEY_DB], results_ma[KEY_DB]], y=[hr_oa, hr_ma],
-                    mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[results_ra[KEY_DB], results_ma[KEY_DB]], y=[hr_ra, hr_ma],
-                    mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
-                ))
-                pts_x = [results_ma[KEY_DB]]
-                pts_y = [hr_ma]
-                for pt in cycle_points:
-                    pts_x.append(pt["state"][KEY_DB])
-                    pts_y.append(pt["state"][KEY_HR] * y_scale)
-                if len(pts_x) > 1:
-                    fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
-                fig.add_trace(go.Scatter(
-                    x=[results_ra[KEY_DB]], y=[hr_ra],
-                    mode='markers+text', text=['Return'], textposition='top center',
-                    marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[results_oa[KEY_DB]], y=[hr_oa],
-                    mode='markers+text', text=['Outside'], textposition='top center',
-                    marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[results_ma[KEY_DB]], y=[hr_ma],
-                    mode='markers+text', text=['Mixed Air'], textposition='top center',
-                    marker=dict(size=12, color='orange', symbol='diamond'), showlegend=False, hoverinfo='skip',
-                ))
-            for i, pt in enumerate(cycle_points):
-                fig.add_trace(go.Scatter(
-                    x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
-                    mode='markers+text', text=[pt["name"]], textposition='top center',
-                    marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
-                ))
-            def _arrow(ax, ay, x, y):
-                cycle_arrow_annotations.append(dict(
-                    x=x, y=y, ax=ax, ay=ay,
-                    xref="x", yref="y", axref="x", ayref="y",
-                    showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
-                ))
-            if pct_oa >= 99.5:
-                pts_x = [results_oa[KEY_DB]]
-                pts_y = [hr_oa]
-                for pt in cycle_points:
-                    pts_x.append(pt["state"][KEY_DB])
-                    pts_y.append(pt["state"][KEY_HR] * y_scale)
-                for i in range(len(pts_x) - 1):
-                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
-            elif pct_oa <= 0.5:
-                pts_x = [results_ra[KEY_DB]]
-                pts_y = [hr_ra]
-                for pt in cycle_points:
-                    pts_x.append(pt["state"][KEY_DB])
-                    pts_y.append(pt["state"][KEY_HR] * y_scale)
-                for i in range(len(pts_x) - 1):
-                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
-            else:
-                _arrow(results_oa[KEY_DB], hr_oa, results_ma[KEY_DB], hr_ma)
-                _arrow(results_ra[KEY_DB], hr_ra, results_ma[KEY_DB], hr_ma)
-                for i in range(len(pts_x) - 1):
-                    _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
-
-    # Add hover grid trace LAST (after all state points) so it's on top and receives hover everywhere
-    # Critical: opacity must be > 0 for Plotly to register hover events; using 0.05 for reliability
-    if len(grid_customdata) > 0:
-        hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
-        dynamic_hover_tmpl = (
-            f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
-            f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
-            "RH: %{customdata[2]:.2f} %<br>"
-            f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
-            f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
-            f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
-            "<extra></extra>"
-        )
-        # Large marker size (100) with overlapping hit areas ensures full chart coverage
-        # Opacity 0.1 is faint but visible enough for Plotly/Streamlit to reliably register hover
-        fig.add_trace(go.Scatter(
-            x=valid_x,
-            y=valid_y,
-            mode='markers',
-            marker=dict(size=100, opacity=0.1, color='lightgray', line=dict(width=0)),
-            showlegend=False,
-            hovertemplate=dynamic_hover_tmpl,
-            customdata=grid_customdata,
-            name='_hover_grid',
-            visible=True,
-            hoverlabel=dict(bgcolor=hover_bg, font_size=11, font_color=hover_font_color),
-        ))
-
-    # Chart cosmetics (reference style)
-    if USE_SI:
-        yaxis_title = "Humidity Ratio (kg w / kg da)"
-        yaxis_range = [0, max_hr]
-    elif use_grains:
-        yaxis_title = "Humidity Ratio (gr w / lb da)"
-        yaxis_range = [0, max_hr * 7000.0]
-    else:
-        yaxis_title = "Humidity Ratio (lb w / lb da)"
-        yaxis_range = [0, max_hr]
-
-    # Prepare Y-axis tick labels from HR lines (0.002 increments)
-    yaxis_tickvals = []
-    yaxis_ticktext = []
-    if show_hr_lines and len(hr_labels) > 0:
-        hr_labels_sorted = sorted(hr_labels, key=lambda x: x['y_scaled'])
-        for label in hr_labels_sorted:
-            yaxis_tickvals.append(label['y_scaled'])
-            if use_grains:
-                yaxis_ticktext.append(f"{int(label['w'] * 7000.0)}")
-            else:
-                yaxis_ticktext.append(f"{label['w']:.3f}")
-    
-    fig.update_layout(
-        xaxis_title=f"Dry Bulb Temperature ({TEMP_LABEL})",
-        yaxis_title=yaxis_title,
-        yaxis=dict(
-            side="right",
-            showgrid=False,
-            zeroline=False,
-            range=yaxis_range,
-            tickmode='array' if len(yaxis_tickvals) > 0 else 'linear',
-            tickvals=yaxis_tickvals if len(yaxis_tickvals) > 0 else None,
-            ticktext=yaxis_ticktext if len(yaxis_ticktext) > 0 else None,
-        ),
-        xaxis=dict(
-            showgrid=False,
-            zeroline=False,
-            range=[T_MIN, T_MAX],
-        ),
-        height=800,
-        autosize=True,
-        paper_bgcolor=chart_paper_bg,
-        plot_bgcolor=chart_plot_bg,
-        hovermode="closest",
-        font=dict(family="Arial", size=12, color=chart_font_color),
-        margin=dict(l=10, r=10, t=30, b=10),
-        annotations=cycle_arrow_annotations if mode == "Cycle Analysis" else [],  # Cycle arrows, or property labels as traces
-        legend=dict(
-            x=0.02,
-            y=0.98,
-            xanchor="left",
-            yanchor="top",
-            bgcolor=legend_bg,
-            bordercolor="rgba(128,128,128,0.5)" if is_dark else "lightgray",
-            borderwidth=1,
-            font=dict(color=legend_font_color),
-        ),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    if mode == "Cycle Analysis":
-        results_ra_t = st.session_state.get("cycle_ra")
-        results_oa_t = st.session_state.get("cycle_oa")
-        results_ma_t = st.session_state.get("cycle_ma")
-        cycle_points_t = st.session_state.get("cycle_points", [])
-        if results_ra_t is not None and results_oa_t is not None and results_ma_t is not None:
-            # Mass flow: actual volumetric airflow x actual moist-air density at MA (altitude, T, humidity).
-            # Energy: actual delta-enthalpy (PsychroLib) x actual mass flow — not 1.08*CFM*dT or similar.
-            # Condensate: actual mass flow x |delta humidity ratio|.
-            total_airflow = st.session_state.get("cycle_total_airflow", 10000.0 if not USE_SI else 5000.0)
-            if USE_SI:
-                mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS] / 3600.0  # kg/s
-            else:
-                mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS]  # lb/min
-
-            # Column headers with units; energy/condensate columns follow global IP/SI toggle
-            base_cols = ["Point Name", f"DB ({TEMP_LABEL})", f"WB ({TEMP_LABEL})", "RH (%)", f"Enthalpy ({ENTHALPY_LABEL})", f"Dew Point ({TEMP_LABEL})"]
-            if USE_SI:
-                cols = base_cols + ["Energy (kW)", "Condensate (L/min)"]
-            else:
-                cols = base_cols + ["Energy (BTU/hr)", "Condensate (GPM)"]
-            empty_extra = ("", "")  # for RA, OA, MA rows
-            rows = [
-                ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]) + empty_extra,
-                ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]) + empty_extra,
-                ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]) + empty_extra,
-            ]
-            for i, pt in enumerate(cycle_points_t):
-                s = pt["state"]
-                prev = results_ma_t if i == 0 else cycle_points_t[i - 1]["state"]
-                delta_h = s[KEY_ENTH] - prev[KEY_ENTH]
-                delta_hr = s[KEY_HR] - prev[KEY_HR]
+        # Air Mixing mode: Plot Point 1, Point 2, and Mixed Air
+        elif mode == "Air Mixing" and results_1 is not None and results_2 is not None:
+            # Recalculate mixed air based on current unit system (don't use stored results_mix)
+            airflow_1_chart = st.session_state.get("airflow_1", 0.0)
+            airflow_type_1_chart = st.session_state.get("airflow_type_1", "ACFM")
+            airflow_2_chart = st.session_state.get("airflow_2", 0.0)
+            airflow_type_2_chart = st.session_state.get("airflow_type_2", "ACFM")
+            
+            # Calculate mass flows
+            def _calc_mass_flow_chart(airflow_val, airflow_type, results_dict):
+                if results_dict is None or KEY_DENS not in results_dict:
+                    return None
                 if USE_SI:
-                    thermal_W = delta_h * mass_flow_cycle
-                    thermal_kw = thermal_W / 1000.0
-                    en_str = f"{thermal_kw:.2f}"
+                    return airflow_val * results_dict[KEY_DENS] / 3600.0  # kg/s
                 else:
-                    thermal_btuh = delta_h * mass_flow_cycle * 60.0
-                    en_str = f"{thermal_btuh:.0f}"
-                if delta_hr < 0:
-                    water_removal = mass_flow_cycle * abs(delta_hr)
-                    if USE_SI:
-                        lpm = water_removal * 60.0
-                        cond_str = f"{lpm:.3f}"
-                    else:
-                        gpm = water_removal / 8.34
-                        cond_str = f"{gpm:.3f}"
-                else:
-                    cond_str = ""
-                rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP], en_str, cond_str))
-            st.subheader("Cycle Data")
-            df_cycle = pd.DataFrame(rows, columns=cols)
-            st.markdown(
-                "<style>"
-                "[data-testid='stDataFrame'] th, [data-testid='stDataFrame'] td, "
-                "[data-testid='stDataFrame'] table th, [data-testid='stDataFrame'] table td, "
-                ".stDataFrame th, .stDataFrame td { text-align: center !important; }"
-                "</style>",
-                unsafe_allow_html=True,
-            )
-            st.dataframe(df_cycle, use_container_width=True, hide_index=True)
-            if len(cycle_points_t) > 0:
-                st.caption("To remove a user-added point, select it below and click Remove.")
-                rm_col1, rm_col2 = st.columns([2, 1])
-                with rm_col1:
-                    point_names = ["-- Select point to remove --"] + [pt["name"] for pt in cycle_points_t]
-                    selected_to_remove = st.selectbox(
-                        "User-added point to remove",
-                        options=point_names,
-                        key="cycle_select_remove",
-                        label_visibility="collapsed",
+                    if airflow_type == "ACFM":
+                        return airflow_val * results_dict[KEY_DENS]  # lb/min
+                    else:  # SCFM
+                        return airflow_val * 0.075  # lb/min
+            
+            mass_flow_1_chart = _calc_mass_flow_chart(airflow_1_chart, airflow_type_1_chart, results_1)
+            mass_flow_2_chart = _calc_mass_flow_chart(airflow_2_chart, airflow_type_2_chart, results_2)
+            
+            # Calculate Mixed Air state
+            results_mix = None
+            if mass_flow_1_chart is not None and mass_flow_2_chart is not None and (mass_flow_1_chart + mass_flow_2_chart) > 0:
+                # Mass-weighted mixing
+                h_mix = (mass_flow_1_chart * results_1[KEY_ENTH] + mass_flow_2_chart * results_2[KEY_ENTH]) / (mass_flow_1_chart + mass_flow_2_chart)
+                w_mix = (mass_flow_1_chart * results_1[KEY_HR] + mass_flow_2_chart * results_2[KEY_HR]) / (mass_flow_1_chart + mass_flow_2_chart)
+                
+                # Solve for mixed air state from h_mix and w_mix
+                chart_t_min_val = st.session_state.get("chart_t_min", DEFAULT_CHART_MIN_F)
+                chart_t_max_val = st.session_state.get("chart_t_max", DEFAULT_CHART_MAX_F)
+                t_min_solve_mix = (chart_t_min_val - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min_val
+                t_max_solve_mix = (chart_t_max_val - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max_val
+                try:
+                    results_mix = solve_state_from_enthalpy_humratio(
+                        h_mix, w_mix, PRESSURE, t_min_solve_mix, t_max_solve_mix
                     )
-                with rm_col2:
-                    if st.button("Remove selected point", key="cycle_remove_btn"):
-                        if selected_to_remove and selected_to_remove != "-- Select point to remove --":
-                            updated = [p for p in cycle_points_t if p["name"] != selected_to_remove]
-                            st.session_state["cycle_points"] = updated
-                            st.rerun()
-
-    st.divider()
-    st.subheader("Chart & Altitude Settings")
-    limits_col, altitude_col, toggles_col = st.columns([2, 2, 1])
-
-    with limits_col:
+                except Exception:
+                    results_mix = None
+            
+            hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
+            # Point 1
+            hr_value_1 = results_1[KEY_HR]
+            hr_display_value_1 = (hr_value_1 * 7000.0 if use_grains else hr_value_1) if not USE_SI else hr_value_1
+            state_customdata_1 = [[
+                results_1[KEY_DB],
+                hr_display_value_1,
+                results_1[KEY_RH],
+                results_1[KEY_WB],
+                results_1[KEY_DP],
+                results_1[KEY_ENTH],
+            ]]
+            hover_tmpl_1 = (
+                "Point 1<br>"
+                f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                "RH: %{customdata[2]:.2f} %<br>"
+                f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                "<extra></extra>"
+            )
+            
+            fig.add_trace(go.Scatter(
+                x=[results_1[KEY_DB]],
+                y=[hr_value_1 * y_scale],
+                mode='markers+text',
+                name='Point 1',
+                showlegend=False,
+                text=['Point 1'],
+                textposition="top center",
+                marker=dict(size=12, color='blue', symbol='circle'),
+                customdata=state_customdata_1,
+                hovertemplate=hover_tmpl_1,
+                hoverlabel=dict(
+                    bgcolor="#ccccff",
+                    font_color=hover_font_color,
+                ),
+            ))
+            
+            # Point 2
+            hr_value_2 = results_2[KEY_HR]
+            hr_display_value_2 = (hr_value_2 * 7000.0 if use_grains else hr_value_2) if not USE_SI else hr_value_2
+            state_customdata_2 = [[
+                results_2[KEY_DB],
+                hr_display_value_2,
+                results_2[KEY_RH],
+                results_2[KEY_WB],
+                results_2[KEY_DP],
+                results_2[KEY_ENTH],
+            ]]
+            hover_tmpl_2 = (
+                "Point 2<br>"
+                f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                "RH: %{customdata[2]:.2f} %<br>"
+                f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                "<extra></extra>"
+            )
+            
+            fig.add_trace(go.Scatter(
+                x=[results_2[KEY_DB]],
+                y=[hr_value_2 * y_scale],
+                mode='markers+text',
+                name='Point 2',
+                showlegend=False,
+                text=['Point 2'],
+                textposition="top center",
+                marker=dict(size=12, color='green', symbol='square'),
+                customdata=state_customdata_2,
+                hovertemplate=hover_tmpl_2,
+                hoverlabel=dict(
+                    bgcolor="#ccffcc",
+                    font_color=hover_font_color,
+                ),
+            ))
+            
+            # Mixed Air Point (if calculated)
+            if results_mix is not None:
+                hr_value_mix = results_mix[KEY_HR]
+                hr_display_value_mix = (hr_value_mix * 7000.0 if use_grains else hr_value_mix) if not USE_SI else hr_value_mix
+                state_customdata_mix = [[
+                    results_mix[KEY_DB],
+                    hr_display_value_mix,
+                    results_mix[KEY_RH],
+                    results_mix[KEY_WB],
+                    results_mix[KEY_DP],
+                    results_mix[KEY_ENTH],
+                ]]
+                hover_tmpl_mix = (
+                    "Mixed Air<br>"
+                    f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                    f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                    "RH: %{customdata[2]:.2f} %<br>"
+                    f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                    f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                    f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                    "<extra></extra>"
+                )
+                
+                fig.add_trace(go.Scatter(
+                    x=[results_mix[KEY_DB]],
+                    y=[hr_value_mix * y_scale],
+                    mode='markers+text',
+                    name='Mixed Air',
+                    showlegend=False,
+                    text=['Mixed Air'],
+                    textposition="top center",
+                    marker=dict(size=12, color='orange', symbol='diamond'),
+                    customdata=state_customdata_mix,
+                    hovertemplate=hover_tmpl_mix,
+                    hoverlabel=dict(
+                        bgcolor="#ffddcc",
+                        font_color=hover_font_color,
+                    ),
+                ))
+            
+            # Draw line connecting Point 1 and Point 2 (Mixed Air should lie on this line)
+            fig.add_trace(go.Scatter(
+                x=[results_1[KEY_DB], results_2[KEY_DB]],
+                y=[hr_value_1 * y_scale, hr_value_2 * y_scale],
+                mode='lines',
+                name='Mixing Line',
+                showlegend=False,
+                line=dict(color='gray', width=2, dash='dash'),
+                hoverinfo='skip',
+            ))
+            
+            results = None  # Not used in mixing mode
+    
+        elif mode == "Cycle Analysis":
+            results_ra = st.session_state.get("cycle_ra")
+            results_oa = st.session_state.get("cycle_oa")
+            results_ma = st.session_state.get("cycle_ma")
+            cycle_points = st.session_state.get("cycle_points", [])
+            pct_oa = st.session_state.get("cycle_pct_oa", 20.0)
+            if results_ma is not None:
+                hr_ra = (results_ra[KEY_HR] * y_scale) if results_ra is not None else None
+                hr_oa = (results_oa[KEY_HR] * y_scale) if results_oa is not None else None
+                hr_ma = results_ma[KEY_HR] * y_scale
+                # 100% OA: only OA visible; OA is the start of the chain. 0% OA: only RA visible; RA is the start.
+                if pct_oa >= 99.5:
+                    pts_x = [results_oa[KEY_DB]]
+                    pts_y = [hr_oa]
+                    for pt in cycle_points:
+                        pts_x.append(pt["state"][KEY_DB])
+                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    if len(pts_x) > 1:
+                        fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                    fig.add_trace(go.Scatter(
+                        x=[results_oa[KEY_DB]], y=[hr_oa],
+                        mode='markers+text', text=['Outside Air'], textposition='top center',
+                        marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                    ))
+                elif pct_oa <= 0.5:
+                    pts_x = [results_ra[KEY_DB]]
+                    pts_y = [hr_ra]
+                    for pt in cycle_points:
+                        pts_x.append(pt["state"][KEY_DB])
+                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    if len(pts_x) > 1:
+                        fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                    fig.add_trace(go.Scatter(
+                        x=[results_ra[KEY_DB]], y=[hr_ra],
+                        mode='markers+text', text=['Return Air'], textposition='top center',
+                        marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                    ))
+                else:
+                    # Mixed: show RA, OA, MA and mixing lines
+                    fig.add_trace(go.Scatter(
+                        x=[results_oa[KEY_DB], results_ma[KEY_DB]], y=[hr_oa, hr_ma],
+                        mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=[results_ra[KEY_DB], results_ma[KEY_DB]], y=[hr_ra, hr_ma],
+                        mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                    ))
+                    pts_x = [results_ma[KEY_DB]]
+                    pts_y = [hr_ma]
+                    for pt in cycle_points:
+                        pts_x.append(pt["state"][KEY_DB])
+                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    if len(pts_x) > 1:
+                        fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                    fig.add_trace(go.Scatter(
+                        x=[results_ra[KEY_DB]], y=[hr_ra],
+                        mode='markers+text', text=['Return'], textposition='top center',
+                        marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=[results_oa[KEY_DB]], y=[hr_oa],
+                        mode='markers+text', text=['Outside'], textposition='top center',
+                        marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=[results_ma[KEY_DB]], y=[hr_ma],
+                        mode='markers+text', text=['Mixed Air'], textposition='top center',
+                        marker=dict(size=12, color='orange', symbol='diamond'), showlegend=False, hoverinfo='skip',
+                    ))
+                for i, pt in enumerate(cycle_points):
+                    fig.add_trace(go.Scatter(
+                        x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
+                        mode='markers+text', text=[pt["name"]], textposition='top center',
+                        marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
+                    ))
+                def _arrow(ax, ay, x, y):
+                    cycle_arrow_annotations.append(dict(
+                        x=x, y=y, ax=ax, ay=ay,
+                        xref="x", yref="y", axref="x", ayref="y",
+                        showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
+                    ))
+                if pct_oa >= 99.5:
+                    pts_x = [results_oa[KEY_DB]]
+                    pts_y = [hr_oa]
+                    for pt in cycle_points:
+                        pts_x.append(pt["state"][KEY_DB])
+                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    for i in range(len(pts_x) - 1):
+                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+                elif pct_oa <= 0.5:
+                    pts_x = [results_ra[KEY_DB]]
+                    pts_y = [hr_ra]
+                    for pt in cycle_points:
+                        pts_x.append(pt["state"][KEY_DB])
+                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    for i in range(len(pts_x) - 1):
+                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+                else:
+                    _arrow(results_oa[KEY_DB], hr_oa, results_ma[KEY_DB], hr_ma)
+                    _arrow(results_ra[KEY_DB], hr_ra, results_ma[KEY_DB], hr_ma)
+                    for i in range(len(pts_x) - 1):
+                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+    
+        # Add hover grid trace LAST (after all state points) so it's on top and receives hover everywhere
+        # Critical: opacity must be > 0 for Plotly to register hover events; using 0.05 for reliability
+        if len(grid_customdata) > 0:
+            hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
+            dynamic_hover_tmpl = (
+                f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                "RH: %{customdata[2]:.2f} %<br>"
+                f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                "<extra></extra>"
+            )
+            # Large marker size (100) with overlapping hit areas ensures full chart coverage
+            # Opacity 0.1 is faint but visible enough for Plotly/Streamlit to reliably register hover
+            fig.add_trace(go.Scatter(
+                x=valid_x,
+                y=valid_y,
+                mode='markers',
+                marker=dict(size=100, opacity=0.1, color='lightgray', line=dict(width=0)),
+                showlegend=False,
+                hovertemplate=dynamic_hover_tmpl,
+                customdata=grid_customdata,
+                name='_hover_grid',
+                visible=True,
+                hoverlabel=dict(bgcolor=hover_bg, font_size=11, font_color=hover_font_color),
+            ))
+    
+        # Chart cosmetics (reference style)
         if USE_SI:
-            chart_min_disp = (chart_t_min - 32.0) * 5.0 / 9.0
-            chart_max_disp = (chart_t_max - 32.0) * 5.0 / 9.0
-            new_c_min = st.number_input(
-                "Chart Min Dry Bulb (°C)",
-                key="chart_t_min_c",
-                value=round(chart_min_disp, 1),
-                step=0.5,
-                min_value=-30.0,
-                max_value=65.0,
-            )
-            new_c_max = st.number_input(
-                "Chart Max Dry Bulb (°C)",
-                key="chart_t_max_c",
-                value=round(chart_max_disp, 1),
-                step=0.5,
-                min_value=new_c_min + 3.0,
-                max_value=65.0,
-            )
-            st.session_state["chart_t_min"] = new_c_min * 9.0 / 5.0 + 32.0
-            st.session_state["chart_t_max"] = new_c_max * 9.0 / 5.0 + 32.0
+            yaxis_title = "Humidity Ratio (kg w / kg da)"
+            yaxis_range = [0, max_hr]
+        elif use_grains:
+            yaxis_title = "Humidity Ratio (gr w / lb da)"
+            yaxis_range = [0, max_hr * 7000.0]
         else:
-            new_chart_t_min = st.number_input(
-                "Chart Min Dry Bulb (°F)",
-                key="chart_t_min",
-                value=chart_t_min,
-                step=1.0,
-                min_value=-20.0,
-                max_value=150.0,
-            )
-            new_chart_t_max = st.number_input(
-                "Chart Max Dry Bulb (°F)",
-                key="chart_t_max",
-                value=chart_t_max,
-                step=1.0,
-                min_value=new_chart_t_min + 5.0,
-                max_value=150.0,
-            )
-
-    with altitude_col:
-        if USE_SI:
-            alt_m = st.number_input(
-                "Altitude (m)",
-                key="altitude_m",
-                value=round(altitude_ft * 0.3048, 0),
-                step=100.0,
-                min_value=-300.0,
-                max_value=6000.0,
-            )
-            st.session_state["altitude_ft"] = alt_m / 0.3048
-        else:
-            new_altitude = st.number_input(
-                "Altitude (ft)",
-                key="altitude_ft",
-                value=altitude_ft,
-                step=100.0,
-                min_value=-1000.0,
-                max_value=20000.0,
-            )
-
-        # Recompute density at current state for display (single state point mode only)
-        if mode == "Single State Point" and results_1 is not None:
-            st.metric(KEY_DENS, f"{results_1[KEY_DENS]:.4f}")
-
-    with toggles_col:
-        st.markdown("**Display**")
-        st.radio(
-            "Units",
-            ["°F (IP)", "°C (SI)"],
-            index=0,  # default first time; after that key="unit_radio" holds selection
-            key="unit_radio",
+            yaxis_title = "Humidity Ratio (lb w / lb da)"
+            yaxis_range = [0, max_hr]
+    
+        # Prepare Y-axis tick labels from HR lines (0.002 increments)
+        yaxis_tickvals = []
+        yaxis_ticktext = []
+        if show_hr_lines and len(hr_labels) > 0:
+            hr_labels_sorted = sorted(hr_labels, key=lambda x: x['y_scaled'])
+            for label in hr_labels_sorted:
+                yaxis_tickvals.append(label['y_scaled'])
+                if use_grains:
+                    yaxis_ticktext.append(f"{int(label['w'] * 7000.0)}")
+                else:
+                    yaxis_ticktext.append(f"{label['w']:.3f}")
+        
+        fig.update_layout(
+            xaxis_title=f"Dry Bulb Temperature ({TEMP_LABEL})",
+            yaxis_title=yaxis_title,
+            yaxis=dict(
+                side="right",
+                showgrid=False,
+                zeroline=False,
+                range=yaxis_range,
+                tickmode='array' if len(yaxis_tickvals) > 0 else 'linear',
+                tickvals=yaxis_tickvals if len(yaxis_tickvals) > 0 else None,
+                ticktext=yaxis_ticktext if len(yaxis_ticktext) > 0 else None,
+            ),
+            xaxis=dict(
+                showgrid=False,
+                zeroline=False,
+                range=[T_MIN, T_MAX],
+            ),
+            height=800,
+            autosize=True,
+            paper_bgcolor=chart_paper_bg,
+            plot_bgcolor=chart_plot_bg,
+            hovermode="closest",
+            font=dict(family="Arial", size=12, color=chart_font_color),
+            margin=dict(l=10, r=10, t=30, b=10),
+            annotations=cycle_arrow_annotations if mode == "Cycle Analysis" else [],  # Cycle arrows, or property labels as traces
+            legend=dict(
+                x=0.02,
+                y=0.98,
+                xanchor="left",
+                yanchor="top",
+                bgcolor=legend_bg,
+                bordercolor="rgba(128,128,128,0.5)" if is_dark else "lightgray",
+                borderwidth=1,
+                font=dict(color=legend_font_color),
+            ),
         )
-        st.session_state["use_si_units"] = (st.session_state["unit_radio"] == "°C (SI)")
-        if not USE_SI:
-            st.checkbox("HR in gr/lb", value=st.session_state.get("hr_grains_toggle", False), key="hr_grains_toggle")
-        st.markdown("**Chart Lines**")
-        st.checkbox("Wet Bulb", value=st.session_state.get("show_wb_lines", False), key="show_wb_lines")
-        st.checkbox("Dew Point", value=st.session_state.get("show_dp_lines", False), key="show_dp_lines")
-        st.checkbox("Enthalpy", value=st.session_state.get("show_enthalpy_lines", True), key="show_enthalpy_lines")
-        st.checkbox("HR Grid", value=st.session_state.get("show_hr_lines", True), key="show_hr_lines")
-
+    
+        markup_mode = st.session_state.get("markup_mode", False)
+        if markup_mode:
+            # Draw-on-chart: custom HTML overlay. Works locally; on Streamlit Cloud / many hosts, inline
+            # script in st.components.v1.html is often blocked by CSP/sandbox, so drawing may not work.
+            try:
+                chart_img_bytes = fig.to_image(format="png", width=800, height=640, scale=1)
+            except Exception as e:
+                st.warning("Chart image could not be generated for markup (e.g. kaleido not available in this environment). Showing interactive chart instead.")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                chart_b64 = base64.b64encode(chart_img_bytes).decode("utf-8")
+                chart_data_url = f"data:image/png;base64,{chart_b64}"
+                cw, ch = 800, 640
+    
+                st.caption("If the drawing area is blank or buttons don't work (e.g. on Streamlit Community Cloud), run the app locally for full markup.")
+    
+                # Toolbar in Streamlit (tool and color); drawing + undo/clear/download live in the iframe
+                tb1, tb2 = st.columns([1, 2])
+                with tb1:
+                    tool = st.radio("Tool", ["Pen", "Highlighter"], key="markup_tool_radio", horizontal=True, label_visibility="collapsed")
+                with tb2:
+                    # Brand colors (blue = brand blue)
+                    col_opt = ["#E63946", "#00A4EF", "#2A9D8F", "#9B59B6", "#F4D03F"]
+                    labels = ["Red", "Blue", "Green", "Purple", "Yellow"]
+                    sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_color_radio", horizontal=True, label_visibility="collapsed")
+                    chosen_hex = col_opt[sel]
+                stroke_width = 10 if tool == "Pen" else 20  # pen = half of highlighter
+                hex_c = chosen_hex.lstrip("#")
+                r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+                stroke_color_hex = chosen_hex
+                stroke_color_rgba = f"rgba({r},{g},{b},0.15)" if tool == "Highlighter" else chosen_hex  # 50% more transparent
+    
+                markup_html = _markup_overlay_html(
+                    chart_data_url=chart_data_url, width=cw, height=ch,
+                    stroke_width=stroke_width, stroke_color=stroke_color_rgba, stroke_hex=stroke_color_hex,
+                )
+                iframe_h = min(ch + 56, 720)
+                st.components.v1.html(markup_html, height=iframe_h, scrolling=False)
+        else:
+            st.plotly_chart(fig, use_container_width=True)
+    
+        if mode == "Cycle Analysis":
+            results_ra_t = st.session_state.get("cycle_ra")
+            results_oa_t = st.session_state.get("cycle_oa")
+            results_ma_t = st.session_state.get("cycle_ma")
+            cycle_points_t = st.session_state.get("cycle_points", [])
+            if results_ra_t is not None and results_oa_t is not None and results_ma_t is not None:
+                # Mass flow: actual volumetric airflow x actual moist-air density at MA (altitude, T, humidity).
+                # Energy: actual delta-enthalpy (PsychroLib) x actual mass flow — not 1.08*CFM*dT or similar.
+                # Condensate: actual mass flow x |delta humidity ratio|.
+                total_airflow = st.session_state.get("cycle_total_airflow", 10000.0 if not USE_SI else 5000.0)
+                if USE_SI:
+                    mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS] / 3600.0  # kg/s
+                else:
+                    mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS]  # lb/min
+    
+                # Column headers with units; energy/condensate columns follow global IP/SI toggle
+                base_cols = ["Point Name", f"DB ({TEMP_LABEL})", f"WB ({TEMP_LABEL})", "RH (%)", f"Enthalpy ({ENTHALPY_LABEL})", f"Dew Point ({TEMP_LABEL})"]
+                if USE_SI:
+                    cols = base_cols + ["Energy (kW)", "Condensate (L/min)"]
+                else:
+                    cols = base_cols + ["Energy (BTU/hr)", "Condensate (GPM)"]
+                empty_extra = ("", "")  # for RA, OA, MA rows
+                rows = [
+                    ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]) + empty_extra,
+                    ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]) + empty_extra,
+                    ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]) + empty_extra,
+                ]
+                for i, pt in enumerate(cycle_points_t):
+                    s = pt["state"]
+                    prev = results_ma_t if i == 0 else cycle_points_t[i - 1]["state"]
+                    delta_h = s[KEY_ENTH] - prev[KEY_ENTH]
+                    delta_hr = s[KEY_HR] - prev[KEY_HR]
+                    if USE_SI:
+                        thermal_W = delta_h * mass_flow_cycle
+                        thermal_kw = thermal_W / 1000.0
+                        en_str = f"{thermal_kw:.2f}"
+                    else:
+                        thermal_btuh = delta_h * mass_flow_cycle * 60.0
+                        en_str = f"{thermal_btuh:.0f}"
+                    if delta_hr < 0:
+                        water_removal = mass_flow_cycle * abs(delta_hr)
+                        if USE_SI:
+                            lpm = water_removal * 60.0
+                            cond_str = f"{lpm:.3f}"
+                        else:
+                            gpm = water_removal / 8.34
+                            cond_str = f"{gpm:.3f}"
+                    else:
+                        cond_str = ""
+                    rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP], en_str, cond_str))
+                st.subheader("Cycle Data")
+                df_cycle = pd.DataFrame(rows, columns=cols)
+                st.markdown(
+                    "<style>"
+                    "[data-testid='stDataFrame'] th, [data-testid='stDataFrame'] td, "
+                    "[data-testid='stDataFrame'] table th, [data-testid='stDataFrame'] table td, "
+                    ".stDataFrame th, .stDataFrame td { text-align: center !important; }"
+                    "</style>",
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(df_cycle, use_container_width=True, hide_index=True)
+                if len(cycle_points_t) > 0:
+                    st.caption("To remove a user-added point, select it below and click Remove.")
+                    rm_col1, rm_col2 = st.columns([2, 1])
+                    with rm_col1:
+                        point_names = ["-- Select point to remove --"] + [pt["name"] for pt in cycle_points_t]
+                        selected_to_remove = st.selectbox(
+                            "User-added point to remove",
+                            options=point_names,
+                            key="cycle_select_remove",
+                            label_visibility="collapsed",
+                        )
+                    with rm_col2:
+                        if st.button("Remove selected point", key="cycle_remove_btn"):
+                            if selected_to_remove and selected_to_remove != "-- Select point to remove --":
+                                updated = [p for p in cycle_points_t if p["name"] != selected_to_remove]
+                                st.session_state["cycle_points"] = updated
+                                st.rerun()
+    
+        st.divider()
+        st.subheader("Chart & Altitude Settings")
+        limits_col, altitude_col, toggles_col = st.columns([2, 2, 1])
+    
+        with limits_col:
+            if USE_SI:
+                chart_min_disp = (chart_t_min - 32.0) * 5.0 / 9.0
+                chart_max_disp = (chart_t_max - 32.0) * 5.0 / 9.0
+                new_c_min = st.number_input(
+                    "Chart Min Dry Bulb (°C)",
+                    key="chart_t_min_c",
+                    value=round(chart_min_disp, 1),
+                    step=0.5,
+                    min_value=-30.0,
+                    max_value=65.0,
+                )
+                new_c_max = st.number_input(
+                    "Chart Max Dry Bulb (°C)",
+                    key="chart_t_max_c",
+                    value=round(chart_max_disp, 1),
+                    step=0.5,
+                    min_value=new_c_min + 3.0,
+                    max_value=65.0,
+                )
+                st.session_state["chart_t_min"] = new_c_min * 9.0 / 5.0 + 32.0
+                st.session_state["chart_t_max"] = new_c_max * 9.0 / 5.0 + 32.0
+            else:
+                new_chart_t_min = st.number_input(
+                    "Chart Min Dry Bulb (°F)",
+                    key="chart_t_min",
+                    value=chart_t_min,
+                    step=1.0,
+                    min_value=-20.0,
+                    max_value=150.0,
+                )
+                new_chart_t_max = st.number_input(
+                    "Chart Max Dry Bulb (°F)",
+                    key="chart_t_max",
+                    value=chart_t_max,
+                    step=1.0,
+                    min_value=new_chart_t_min + 5.0,
+                    max_value=150.0,
+                )
+    
+        with altitude_col:
+            if USE_SI:
+                alt_m = st.number_input(
+                    "Altitude (m)",
+                    key="altitude_m",
+                    value=round(altitude_ft * 0.3048, 0),
+                    step=100.0,
+                    min_value=-300.0,
+                    max_value=6000.0,
+                )
+                st.session_state["altitude_ft"] = alt_m / 0.3048
+            else:
+                new_altitude = st.number_input(
+                    "Altitude (ft)",
+                    key="altitude_ft",
+                    value=altitude_ft,
+                    step=100.0,
+                    min_value=-1000.0,
+                    max_value=20000.0,
+                )
+    
+            # Recompute density at current state for display (single state point mode only)
+            if mode == "Single State Point" and results_1 is not None:
+                st.metric(KEY_DENS, f"{results_1[KEY_DENS]:.4f}")
+    
+        with toggles_col:
+            st.markdown("**Display**")
+            st.radio(
+                "Units",
+                ["°F (IP)", "°C (SI)"],
+                index=0,  # default first time; after that key="unit_radio" holds selection
+                key="unit_radio",
+            )
+            st.session_state["use_si_units"] = (st.session_state["unit_radio"] == "°C (SI)")
+            if not USE_SI:
+                st.checkbox("HR in gr/lb", value=st.session_state.get("hr_grains_toggle", False), key="hr_grains_toggle")
+            # Live Markup / Annotate hidden — doesn't work on cloud (Kaleido/CSP); use Mode "Markup" with psych_bg.png instead
+            st.markdown("**Chart Lines**")
+            st.checkbox("Wet Bulb", value=st.session_state.get("show_wb_lines", False), key="show_wb_lines")
+            st.checkbox("Dew Point", value=st.session_state.get("show_dp_lines", False), key="show_dp_lines")
+            st.checkbox("Enthalpy", value=st.session_state.get("show_enthalpy_lines", True), key="show_enthalpy_lines")
+            st.checkbox("HR Grid", value=st.session_state.get("show_hr_lines", True), key="show_hr_lines")
+    
 # Full-width section: Process mode - Point 1 | Point 2 | Process Summary
 if st.session_state.get("mode") == "Process":
     r1 = st.session_state.get("results_1")
@@ -2573,7 +2801,7 @@ if st.session_state.get("mode") == "Air Mixing":
             st.warning("Mixed air calculation requires valid mass flows for both points.")
             st.session_state["results_mix"] = None
 
-# --- FOOTER / DISCLAIMER --- 
+# --- FOOTER / DISCLAIMER ---
 st.markdown("---")
 st.markdown(
     """
