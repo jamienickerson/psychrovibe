@@ -2573,7 +2573,7 @@ if st.session_state.get("mode") == "Air Mixing":
             st.warning("Mixed air calculation requires valid mass flows for both points.")
             st.session_state["results_mix"] = None
 
-# --- FOOTER / DISCLAIMER ---
+# --- FOOTER / DISCLAIMER --- 
 st.markdown("---")
 st.markdown(
     """
