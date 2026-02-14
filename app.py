@@ -43,21 +43,22 @@ def _markup_overlay_html(chart_data_url, width, height, stroke_width, stroke_col
 <html>
 <head><meta charset="utf-8"><style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
-  #mup {{ position: relative; max-width: 100%; max-height: 80vh; width: 100%; aspect-ratio: {width} / {height}; }}
+  html, body {{ height: 100%; display: flex; flex-direction: column; }}
+  #mup {{ position: relative; flex: 1; min-height: 0; width: 100%; max-width: 100%; aspect-ratio: {width} / {height}; }}
   #mup img {{ position: absolute; left:0; top:0; width:100%; height:100%; display:block; pointer-events:none; object-fit: contain; }}
   #mup canvas {{ position: absolute; left:0; top:0; width:100%; height:100%; cursor:crosshair; }}
-  #mup-tb {{ display:flex; gap:8px; align-items:center; padding:6px 0; }}
-  #mup-tb button {{ padding:6px 12px; cursor:pointer; }}
+  #mup-tb {{ flex-shrink: 0; display: flex; gap: 6px; align-items: center; padding: 4px 0; }}
+  #mup-tb button {{ padding: 4px 10px; cursor: pointer; font-size: 13px; }}
 </style></head>
 <body>
+  <div id="mup">
+    <img id="mup-bg" src="{url_esc}" alt="Chart" />
+    <canvas id="mup-canvas" width="{width}" height="{height}"></canvas>
+  </div>
   <div id="mup-tb">
     <button type="button" onclick="undo()">Undo</button>
     <button type="button" onclick="clearAll()">Clear</button>
     <button type="button" onclick="downloadImage()">Download image</button>
-  </div>
-  <div id="mup">
-    <img id="mup-bg" src="{url_esc}" alt="Chart" />
-    <canvas id="mup-canvas" width="{width}" height="{height}"></canvas>
   </div>
   <script>
 (function() {{
@@ -174,8 +175,8 @@ def _render_static_markup_page():
         chart_data_url=chart_data_url, width=w, height=h,
         stroke_width=stroke_width, stroke_color=stroke_color_rgba, stroke_hex=chosen_hex,
     )
-    # No toolbar here; col2 is just the canvas so the image can fill the space. Cap iframe height for large images.
-    iframe_h = min(h + 56, 720)
+    # No toolbar here; col2 is just the canvas so the image can fill the space. Toolbar is at bottom of iframe; allow tall iframe so chart fills.
+    iframe_h = min(h + 44, 900)
     st.components.v1.html(markup_html, height=iframe_h, scrolling=False)
 
 
