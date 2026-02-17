@@ -612,6 +612,289 @@ def solve_state_from_enthalpy_humratio(enthalpy, hum_ratio, pressure, t_min, t_m
     }
 
 
+def find_state_on_enthalpy_at_db(enthalpy, target_db, pressure, t_min, t_max):
+    """
+    Find psychrometric state on a constant enthalpy line at a given dry bulb temperature.
+    Returns state dict or None if not found.
+    """
+    try:
+        # Get humidity ratio at this enthalpy and DB
+        hum_ratio = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(enthalpy, target_db)
+        # Now solve full state
+        return solve_state_from_enthalpy_humratio(enthalpy, hum_ratio, pressure, t_min, t_max)
+    except Exception:
+        return None
+
+
+def get_weather_files():
+    """
+    Look for a folder named 'weather_data' in the current directory.
+    Return a list of all filenames ending in .epw found in that folder.
+    If the folder does not exist or is empty, return an empty list (do not crash).
+    """
+    try:
+        weather_dir = Path("weather_data")
+        if not weather_dir.exists() or not weather_dir.is_dir():
+            return []
+        epw_files = list(weather_dir.glob("*.epw"))
+        return sorted([f.name for f in epw_files])
+    except Exception:
+        return []
+
+
+def load_epw_data(filename):
+    """
+    Load EPW weather file and calculate humidity ratios.
+    
+    EPW Format:
+    - No headers (skip first 8 rows)
+    - Column 6: Dry Bulb Temperature (°C)
+    - Column 7: Dew Point Temperature (°C)
+    - Column 9: Atmospheric Pressure (Pa)
+    
+    EPW files are ALWAYS in SI units (Celsius, Pascals).
+    This function forces psychrolib to SI mode during calculation to match the input format,
+    then restores the original unit system and converts output if needed.
+    
+    Returns:
+    - List of tuples: (dry_bulb, humidity_ratio) in the app's current unit system
+    """
+    try:
+        weather_dir = Path("weather_data")
+        filepath = weather_dir / filename
+        if not filepath.exists():
+            return []
+        
+        # Store the app's current unit system setting BEFORE forcing SI
+        # The app sets psychrolib.SetUnitSystem based on USE_SI at startup, so they should match
+        # We'll restore based on USE_SI after calculations
+        app_use_si = USE_SI
+        
+        # Read EPW file (no headers, comma-delimited)
+        # EPW files are comma-delimited; try comma first, fall back to whitespace
+        try:
+            df = pd.read_csv(filepath, header=None, skiprows=8, sep=',')  # Skip 8 header rows, comma-delimited
+        except Exception:
+            # Fallback to whitespace delimiter
+            df = pd.read_csv(filepath, header=None, skiprows=8, delim_whitespace=True)
+        
+        # Extract columns (0-indexed: column 6 = index 6, column 7 = index 7, column 9 = index 9)
+        dry_bulb_c = df.iloc[:, 6].astype(float).values  # Column 6: Dry Bulb (°C)
+        dew_point_c = df.iloc[:, 7].astype(float).values  # Column 7: Dew Point (°C)
+        pressure_pa = df.iloc[:, 9].astype(float).values  # Column 9: Pressure (Pa)
+        
+        # FORCE psychrolib to SI mode for all calculations
+        # EPW data is always SI, so psychrolib must be SI to interpret inputs correctly
+        psychrolib.SetUnitSystem(psychrolib.SI)
+        
+        # Calculate humidity ratio for each hour using psychrolib (now in SI mode)
+        humidity_ratios_si = []
+        dry_bulbs_si = []
+        
+        for i in range(len(dry_bulb_c)):
+            try:
+                db_c = dry_bulb_c[i]
+                dp_c = dew_point_c[i]
+                p_pa = pressure_pa[i]
+                
+                # Skip invalid data
+                if pd.isna(db_c) or pd.isna(dp_c) or pd.isna(p_pa) or p_pa <= 0:
+                    continue
+                
+                # Calculate humidity ratio from dew point
+                # Inputs: dp_c (°C), p_pa (Pa) - both SI
+                # Returns: hr_kg_kg (kg/kg) - SI units
+                hr_kg_kg = psychrolib.GetHumRatioFromTDewPoint(dp_c, p_pa)
+                
+                # Store SI values (we'll convert later if needed)
+                dry_bulbs_si.append(db_c)
+                humidity_ratios_si.append(hr_kg_kg)
+            except Exception:
+                continue
+        
+        # RESTORE the original psychrolib unit system immediately after calculations
+        psychrolib.SetUnitSystem(psychrolib.SI if app_use_si else psychrolib.IP)
+        
+        # Convert output based on app's unit system setting (for display)
+        dry_bulbs = []
+        humidity_ratios = []
+        
+        if app_use_si:
+            # App is in SI mode: return as-is (°C and kg/kg)
+            dry_bulbs = dry_bulbs_si
+            humidity_ratios = humidity_ratios_si
+        else:
+            # App is in IP mode: convert Dry Bulb from °C to °F
+            # Note: Humidity Ratio (kg/kg) = (lb/lb) - it's dimensionless, same numeric value
+            for db_c, hr_kg_kg in zip(dry_bulbs_si, humidity_ratios_si):
+                db_f = c_to_f(db_c)
+                dry_bulbs.append(db_f)
+                humidity_ratios.append(hr_kg_kg)  # kg/kg = lb/lb (no conversion needed)
+        
+        return list(zip(dry_bulbs, humidity_ratios))
+    except Exception as e:
+        # Ensure we restore psychrolib unit system even if an error occurs
+        # Use the global USE_SI to restore (should match what was set before)
+        try:
+            psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
+        except:
+            pass
+        return []
+
+
+# When units change, refresh cached weather heatmap so the figure is drawn in the new unit system.
+# (Must run after load_epw_data is defined.)
+if unit_system_changed and st.session_state.get("show_weather_heatmap", False):
+    weather_file = st.session_state.get("weather_file")
+    if weather_file:
+        refreshed = load_epw_data(weather_file)
+        if len(refreshed) > 0:
+            st.session_state["weather_data"] = refreshed
+        else:
+            if "weather_data" in st.session_state:
+                del st.session_state["weather_data"]
+
+
+# Ensure weather_data matches the currently selected file *before* the figure is built.
+# (Figure is built later in the script; the selectbox runs even later, so without this we'd show stale/wrong metro.)
+if st.session_state.get("show_weather_heatmap", False):
+    weather_files = get_weather_files()
+    selected = (
+        st.session_state.get("weather_file_select")
+        or st.session_state.get("weather_file")
+        or (weather_files[0] if weather_files else None)
+    )
+    if selected and (selected in weather_files):
+        need_load = (
+            st.session_state.get("weather_file") != selected
+            or "weather_data" not in st.session_state
+        )
+        if need_load:
+            data = load_epw_data(selected)
+            if len(data) > 0:
+                st.session_state["weather_data"] = data
+                st.session_state["weather_file"] = selected
+            else:
+                if "weather_data" in st.session_state:
+                    del st.session_state["weather_data"]
+                if "weather_file" in st.session_state:
+                    del st.session_state["weather_file"]
+
+
+def get_envelope_polygon(envelope_name, pressure):
+    """
+    Return polygon (x, y) coordinates for an envelope overlay.
+    All coordinates in SI: x = Dry Bulb (°C), y = Humidity Ratio (kg/kg).
+    Uses psychrolib in SI mode for W calculations.
+    """
+    # Use SI for all envelope math (pressure in Pa, T in °C)
+    try:
+        psychrolib.SetUnitSystem(psychrolib.SI)
+    except Exception:
+        pass
+    pts = []
+    try:
+        if envelope_name == "TC 9.9 Recommended":
+            # Point 1: 18°C DB / 5.5°C DP
+            w1 = psychrolib.GetHumRatioFromTDewPoint(5.5, pressure)
+            pts.append((18.0, w1))
+            # Point 2: 27°C DB / 5.5°C DP
+            pts.append((27.0, w1))
+            # Point 3: 27°C DB / 15°C DP or 60% RH (whichever is lower W)
+            w_dp15_27 = psychrolib.GetHumRatioFromTDewPoint(15.0, pressure)
+            w_rh60_27 = psychrolib.GetHumRatioFromRelHum(27.0, 0.60, pressure)
+            pts.append((27.0, min(w_dp15_27, w_rh60_27)))
+            # Point 4: 18°C DB / 15°C DP or 60% RH
+            w_rh60_18 = psychrolib.GetHumRatioFromRelHum(18.0, 0.60, pressure)
+            w_dp15_18 = psychrolib.GetHumRatioFromTDewPoint(15.0, pressure)
+            pts.append((18.0, min(w_dp15_18, w_rh60_18)))
+            # close
+            pts.append(pts[0])
+
+        elif envelope_name == "TC 9.9 Allowable A1":
+            # DB 15–32°C, RH 20–80%, max DP 17°C
+            w_15_20 = psychrolib.GetHumRatioFromRelHum(15.0, 0.20, pressure)
+            w_32_20 = psychrolib.GetHumRatioFromRelHum(32.0, 0.20, pressure)
+            w_17dp = psychrolib.GetHumRatioFromTDewPoint(17.0, pressure)
+            w_32_80 = psychrolib.GetHumRatioFromRelHum(32.0, 0.80, pressure)
+            w_15_80 = psychrolib.GetHumRatioFromRelHum(15.0, 0.80, pressure)
+            w_max_32 = min(w_32_80, w_17dp)
+            w_max_15 = min(w_15_80, w_17dp)
+            pts = [(15.0, w_15_20), (32.0, w_32_20), (32.0, w_max_32), (15.0, w_max_15), (15.0, w_15_20)]
+
+        elif envelope_name == "ASHRAE 55 Summer":
+            # ~23–27°C DB, max W 0.012 kg/kg, min RH ~20%
+            w_23_20 = psychrolib.GetHumRatioFromRelHum(23.0, 0.20, pressure)
+            w_27_20 = psychrolib.GetHumRatioFromRelHum(27.0, 0.20, pressure)
+            w_max = 0.012
+            pts = [(23.0, w_23_20), (27.0, w_27_20), (27.0, w_max), (23.0, w_max), (23.0, w_23_20)]
+
+        elif envelope_name == "ASHRAE 55 Winter":
+            # ~20–24°C DB, max W 0.012 kg/kg
+            w_20_20 = psychrolib.GetHumRatioFromRelHum(20.0, 0.20, pressure)
+            w_24_20 = psychrolib.GetHumRatioFromRelHum(24.0, 0.20, pressure)
+            w_max = 0.012
+            pts = [(20.0, w_20_20), (24.0, w_24_20), (24.0, w_max), (20.0, w_max), (20.0, w_20_20)]
+
+        elif envelope_name == "Custom":
+            # Built from session state in plotting block
+            return None
+    except Exception:
+        pts = []
+    # Restore psychrolib to app unit system
+    try:
+        psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
+    except Exception:
+        pass
+    return pts if pts else []
+
+
+def find_state_on_enthalpy_at_rh(enthalpy, target_rh_pct, pressure, t_min, t_max):
+    """
+    Find psychrometric state on a constant enthalpy line at a given relative humidity.
+    Returns state dict or None if not found.
+    """
+    target_rh = target_rh_pct / 100.0
+    
+    def f(tdb):
+        """Returns RH at DB tdb on the constant enthalpy line."""
+        try:
+            hr = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(enthalpy, tdb)
+            rh_calc = psychrolib.GetRelHumFromHumRatio(tdb, hr, pressure)
+            return rh_calc
+        except Exception:
+            return None
+    
+    try:
+        # Check if we can bracket the solution by evaluating endpoints
+        # On a constant enthalpy line, lower DB typically gives higher RH
+        rh_at_min = f(t_min)
+        rh_at_max = f(t_max)
+        
+        if rh_at_min is None or rh_at_max is None:
+            return None
+        
+        # Ensure we have a bracketed solution (one endpoint above target, one below)
+        # If both endpoints are on the same side of target, we can't find a solution
+        if (rh_at_min < target_rh and rh_at_max < target_rh) or (rh_at_min > target_rh and rh_at_max > target_rh):
+            return None
+        
+        # Use bisection to find DB where RH = target_rh
+        # f(tdb) returns RH, so we want f(tdb) - target_rh = 0
+        def f_for_bisection(tdb):
+            rh_val = f(tdb)
+            if rh_val is None:
+                raise ValueError("Cannot evaluate RH")
+            return rh_val
+        
+        db_result = _solve_db_by_bisection(f_for_bisection, target_rh, t_min, t_max)
+        hr = psychrolib.GetHumRatioFromEnthalpyAndTDryBulb(enthalpy, db_result)
+        return solve_state_from_enthalpy_humratio(enthalpy, hr, pressure, t_min, t_max)
+    except Exception as e:
+        # If bisection fails, return None
+        return None
+
+
 def calculate_properties_from_db_hr(db, hr, pressure, sat_lookup):
     """
     Calculate psychrometric properties from dry bulb temperature and humidity ratio.
@@ -689,187 +972,589 @@ with col1:
         sel = st.radio("Color", range(5), format_func=lambda i: labels[i], key="markup_static_color_radio", horizontal=True, label_visibility="collapsed")
     elif mode == "Cycle Analysis":
         # --- Cycle Analysis (AHU Builder) ---
+        if "cycle_template" not in st.session_state:
+            st.session_state["cycle_template"] = "Custom"
         if "cycle_points" not in st.session_state:
             st.session_state["cycle_points"] = []
         if "cycle_total_airflow" not in st.session_state:
             st.session_state["cycle_total_airflow"] = 10000.0
         if "cycle_pct_oa" not in st.session_state:
             st.session_state["cycle_pct_oa"] = 20.0
-        if "cycle_ra_db" not in st.session_state:
-            st.session_state["cycle_ra_db"] = 75.0 if not USE_SI else 24.0
-        if "cycle_ra_rh" not in st.session_state:
-            st.session_state["cycle_ra_rh"] = 50.0
-        if "cycle_oa_db" not in st.session_state:
-            st.session_state["cycle_oa_db"] = 95.0 if not USE_SI else 35.0
-        if "cycle_oa_rh" not in st.session_state:
-            st.session_state["cycle_oa_rh"] = 40.0
-        if "cycle_new_use_db" not in st.session_state:
-            st.session_state["cycle_new_use_db"] = True
-        if "cycle_new_use_rh" not in st.session_state:
-            st.session_state["cycle_new_use_rh"] = True
-        if "cycle_new_use_wb" not in st.session_state:
-            st.session_state["cycle_new_use_wb"] = False
-        if "cycle_new_use_dp" not in st.session_state:
-            st.session_state["cycle_new_use_dp"] = False
-        if "cycle_new_wb" not in st.session_state:
-            st.session_state["cycle_new_wb"] = 50.0 if not USE_SI else 10.0
-        if "cycle_new_dp" not in st.session_state:
-            st.session_state["cycle_new_dp"] = 45.0 if not USE_SI else 7.0
-
-        # On unit toggle, convert cycle inputs so thermodynamic values stay the same (e.g. 104°F -> 40°C)
-        if unit_system_changed:
-            if USE_SI:  # switching to SI: convert stored IP values to SI
-                st.session_state["cycle_ra_db"] = f_to_c(st.session_state["cycle_ra_db"])
-                st.session_state["cycle_oa_db"] = f_to_c(st.session_state["cycle_oa_db"])
-                st.session_state["cycle_total_airflow"] = int(round(cfm_to_m3_hr(st.session_state["cycle_total_airflow"])))
-                if "cycle_new_db" in st.session_state:
-                    st.session_state["cycle_new_db"] = f_to_c(st.session_state["cycle_new_db"])
-                if "cycle_new_wb" in st.session_state:
-                    st.session_state["cycle_new_wb"] = f_to_c(st.session_state["cycle_new_wb"])
-                if "cycle_new_dp" in st.session_state:
-                    st.session_state["cycle_new_dp"] = f_to_c(st.session_state["cycle_new_dp"])
-                o_db, o_wb, o_dp = "Dry Bulb (°F)", "Wet Bulb (°F)", "Dew Point (°F)"
-                o_enth, o_vol, o_dens = "Enthalpy (Btu/lb)", "Specific Vol (ft³/lb)", "Moist Air Density (lb/ft³)"
-                o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (lb/lb)"
-                for pt in st.session_state.get("cycle_points", []):
-                    s = pt["state"]
-                    pt["state"] = {
-                        KEY_DB: f_to_c(s[o_db]), KEY_WB: f_to_c(s[o_wb]), KEY_DP: f_to_c(s[o_dp]),
-                        KEY_RH: s[o_rh], KEY_HR: s[o_hr],
-                        KEY_ENTH: btu_lb_to_j_kg(s[o_enth]),
-                        KEY_VOL: s[o_vol] * 0.062428, KEY_DENS: s[o_dens] * 16.0185,
-                    }
-            else:  # switching to IP: convert stored SI values to IP
-                st.session_state["cycle_ra_db"] = c_to_f(st.session_state["cycle_ra_db"])
-                st.session_state["cycle_oa_db"] = c_to_f(st.session_state["cycle_oa_db"])
-                st.session_state["cycle_total_airflow"] = int(round(m3_hr_to_cfm(st.session_state["cycle_total_airflow"])))
-                if "cycle_new_db" in st.session_state:
-                    st.session_state["cycle_new_db"] = c_to_f(st.session_state["cycle_new_db"])
-                if "cycle_new_wb" in st.session_state:
-                    st.session_state["cycle_new_wb"] = c_to_f(st.session_state["cycle_new_wb"])
-                if "cycle_new_dp" in st.session_state:
-                    st.session_state["cycle_new_dp"] = c_to_f(st.session_state["cycle_new_dp"])
-                o_db, o_wb, o_dp = "Dry Bulb (°C)", "Wet Bulb (°C)", "Dew Point (°C)"
-                o_enth, o_vol, o_dens = "Enthalpy (J/kg)", "Specific Vol (m³/kg)", "Moist Air Density (kg/m³)"
-                o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (kg/kg)"
-                for pt in st.session_state.get("cycle_points", []):
-                    s = pt["state"]
-                    pt["state"] = {
-                        KEY_DB: c_to_f(s[o_db]), KEY_WB: c_to_f(s[o_wb]), KEY_DP: c_to_f(s[o_dp]),
-                        KEY_RH: s[o_rh], KEY_HR: s[o_hr],
-                        KEY_ENTH: j_kg_to_btu_lb(s[o_enth]),
-                        KEY_VOL: s[o_vol] / 0.062428, KEY_DENS: s[o_dens] / 16.0185,
-                    }
-
-        st.markdown("**Mixing Box**")
-        if USE_SI:
-            total_airflow = st.number_input("Total System Airflow (m³/hr)", value=int(st.session_state.get("cycle_total_airflow", 5000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
-        else:
-            total_airflow = st.number_input("Total System Airflow (CFM)", value=int(st.session_state.get("cycle_total_airflow", 10000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
-        pct_oa = st.slider("% Outside Air", 0, 100, int(st.session_state.get("cycle_pct_oa", 20)), key="cycle_pct_oa")
-        st.markdown("**Return Air (RA)**")
-        ra_db = st.number_input("RA Dry Bulb (" + (TEMP_LABEL + ")"), value=float(st.session_state.get("cycle_ra_db", 75.0 if not USE_SI else 24.0)), step=0.5, key="cycle_ra_db")
-        ra_rh = st.number_input("RA Relative Humidity (%)", value=float(st.session_state.get("cycle_ra_rh", 50.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_ra_rh")
-        st.markdown("**Outside Air (OA)**")
-        oa_db = st.number_input("OA Dry Bulb (" + (TEMP_LABEL + ")"), value=float(st.session_state.get("cycle_oa_db", 95.0 if not USE_SI else 35.0)), step=0.5, key="cycle_oa_db")
-        oa_rh = st.number_input("OA Relative Humidity (%)", value=float(st.session_state.get("cycle_oa_rh", 40.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_oa_rh")
-
-        t_min_solve = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
-        t_max_solve = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
-        results_ra = None
-        results_oa = None
-        results_ma = None
-        try:
-            results_ra = solve_state_from_two(db=ra_db, rh=ra_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
-            results_oa = solve_state_from_two(db=oa_db, rh=oa_rh, wb=None, dp=None, pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
-        except Exception as e:
-            st.error(f"RA or OA state invalid: {e}")
-        if results_ra is not None and results_oa is not None:
-            if pct_oa >= 99.5:
-                results_ma = results_oa
-                st.success("100% Outside Air - no mixing")
-                st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
-            elif pct_oa <= 0.5:
-                results_ma = results_ra
-                st.success("100% Return Air - no mixing")
-                st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
-            else:
-                airflow_oa = total_airflow * (pct_oa / 100.0)
-                airflow_ra = total_airflow * (1.0 - pct_oa / 100.0)
-                if USE_SI:
-                    mass_oa = airflow_oa * results_oa[KEY_DENS] / 3600.0
-                    mass_ra = airflow_ra * results_ra[KEY_DENS] / 3600.0
-                else:
-                    mass_oa = airflow_oa * results_oa[KEY_DENS]
-                    mass_ra = airflow_ra * results_ra[KEY_DENS]
-                tot_mass = mass_oa + mass_ra
-                if tot_mass > 0:
-                    h_mix = (mass_oa * results_oa[KEY_ENTH] + mass_ra * results_ra[KEY_ENTH]) / tot_mass
-                    w_mix = (mass_oa * results_oa[KEY_HR] + mass_ra * results_ra[KEY_HR]) / tot_mass
-                    try:
-                        results_ma = solve_state_from_enthalpy_humratio(h_mix, w_mix, PRESSURE, t_min_solve, t_max_solve)
-                    except Exception:
-                        results_ma = None
-                if results_ma is not None:
-                    st.success("Mixed Air Result")
-                    st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
-
-        st.divider()
-        st.markdown("**Process Chain**")
-        cycle_points = st.session_state.get("cycle_points", [])
-        if len(cycle_points) < 3:
-            st.markdown("Add next component (leaving state):")
+        if "adiabatic_oa_db" not in st.session_state:
+            st.session_state["adiabatic_oa_db"] = 95.0 if not USE_SI else 35.0
+        if "adiabatic_oa_rh" not in st.session_state:
+            st.session_state["adiabatic_oa_rh"] = 40.0
+        if "adiabatic_oa_wb" not in st.session_state:
+            st.session_state["adiabatic_oa_wb"] = 75.0 if not USE_SI else 24.0
+        if "adiabatic_oa_dp" not in st.session_state:
+            st.session_state["adiabatic_oa_dp"] = 70.0 if not USE_SI else 21.0
+        if "adiabatic_oa_use_db" not in st.session_state:
+            st.session_state["adiabatic_oa_use_db"] = True
+        if "adiabatic_oa_use_rh" not in st.session_state:
+            st.session_state["adiabatic_oa_use_rh"] = True
+        if "adiabatic_oa_use_wb" not in st.session_state:
+            st.session_state["adiabatic_oa_use_wb"] = False
+        if "adiabatic_oa_use_dp" not in st.session_state:
+            st.session_state["adiabatic_oa_use_dp"] = False
+        if "adiabatic_effectiveness" not in st.session_state:
+            st.session_state["adiabatic_effectiveness"] = 85.0
+        if "adiabatic_max_rh" not in st.session_state:
+            st.session_state["adiabatic_max_rh"] = 90.0
+        if "adiabatic_airflow" not in st.session_state:
+            st.session_state["adiabatic_airflow"] = 10000.0 if not USE_SI else 5000.0
+        
+        # Template selector at top
+        template = st.selectbox("Load Template", ["Custom", "Recirculating CRAH", "Economizing AHU", "Adiabatic Cooling"], 
+                                index=["Custom", "Recirculating CRAH", "Economizing AHU", "Adiabatic Cooling"].index(st.session_state.get("cycle_template", "Custom")),
+                                key="cycle_template")
+        
+        # Handle template selection
+        if template != st.session_state.get("cycle_template_prev", None):
+            st.session_state["cycle_template_prev"] = template
+            if template == "Recirculating CRAH":
+                st.session_state["cycle_pct_oa"] = 0.0
+                # Set default RA values if not already set
+                if "cycle_ra_db" not in st.session_state or st.session_state.get("cycle_template_prev") != "Recirculating CRAH":
+                    st.session_state["cycle_ra_db"] = 75.0 if not USE_SI else 24.0
+                    st.session_state["cycle_ra_rh"] = 50.0
+                    st.session_state["cycle_ra_use_db"] = True
+                    st.session_state["cycle_ra_use_rh"] = True
+                    st.session_state["cycle_ra_use_wb"] = False
+                    st.session_state["cycle_ra_use_dp"] = False
+                st.session_state["cycle_points"] = []
+                # Add Point 1: Cooling Coil Leaving
+                coil_db = 55.0 if not USE_SI else 13.0
+                coil_state = solve_state_from_two(db=coil_db, rh=95.0, wb=None, dp=None, pressure=PRESSURE, 
+                                                   t_min=(chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min,
+                                                   t_max=(chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max)
+                # Add Point 2: Supply Fan (same HR, +2°F/+1°C - sensible heat only)
+                fan_db = 57.0 if not USE_SI else 14.0
+                fan_hr = coil_state[KEY_HR]
+                # Calculate state from DB and HR (constant HR = sensible heat only)
+                try:
+                    fan_enthalpy = psychrolib.GetMoistAirEnthalpy(fan_db, fan_hr)
+                    fan_state = solve_state_from_enthalpy_humratio(fan_enthalpy, fan_hr, PRESSURE,
+                                                                   t_min=(chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min,
+                                                                   t_max=(chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max)
+                except Exception:
+                    fan_state = None
+                if fan_state:
+                    st.session_state["cycle_points"] = [
+                        {"name": "Cooling Coil Leaving", "state": coil_state},
+                        {"name": "Supply Fan", "state": fan_state}
+                    ]
+                st.rerun()
+            elif template == "Economizing AHU":
+                st.session_state["cycle_pct_oa"] = 20.0
+                st.session_state["cycle_points"] = []
+                # Add Point 1: Cooling Coil Leaving
+                coil_db = 52.0 if not USE_SI else 11.0
+                coil_state = solve_state_from_two(db=coil_db, rh=95.0, wb=None, dp=None, pressure=PRESSURE,
+                                                   t_min=(chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min,
+                                                   t_max=(chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max)
+                # Add Point 2: Supply Fan (same HR, +2°F/+1°C - sensible heat only)
+                fan_db = 54.0 if not USE_SI else 12.0
+                fan_hr = coil_state[KEY_HR]
+                # Calculate state from DB and HR (constant HR = sensible heat only)
+                try:
+                    fan_enthalpy = psychrolib.GetMoistAirEnthalpy(fan_db, fan_hr)
+                    fan_state = solve_state_from_enthalpy_humratio(fan_enthalpy, fan_hr, PRESSURE,
+                                                                   t_min=(chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min,
+                                                                   t_max=(chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max)
+                except Exception:
+                    fan_state = None
+                if fan_state:
+                    st.session_state["cycle_points"] = [
+                        {"name": "Cooling Coil Leaving", "state": coil_state},
+                        {"name": "Supply Fan", "state": fan_state}
+                    ]
+                st.rerun()
+        
+        # Adiabatic Cooling mode: completely different UI
+        if template == "Adiabatic Cooling":
+            st.markdown("**Adiabatic Cooling Calculator**")
+            st.caption("Calculate supply air state and water consumption for adiabatic cooling.")
+            
+            st.markdown("**OA State**")
             st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
-            c_db_sel, c_db_in = st.columns([0.25, 0.75])
-            with c_db_sel:
-                c_use_db = st.checkbox("DB", value=st.session_state.get("cycle_new_use_db", True), key="cycle_new_use_db")
-            with c_db_in:
-                c_db = st.number_input("DB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_db", 55.0 if not USE_SI else 13.0)), step=0.5, key="cycle_new_db")
-            c_rh_sel, c_rh_in = st.columns([0.25, 0.75])
-            with c_rh_sel:
-                c_use_rh = st.checkbox("RH", value=st.session_state.get("cycle_new_use_rh", True), key="cycle_new_use_rh")
-            with c_rh_in:
-                c_rh = st.number_input("RH (%)", value=float(st.session_state.get("cycle_new_rh", 90.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_new_rh")
-            c_wb_sel, c_wb_in = st.columns([0.25, 0.75])
-            with c_wb_sel:
-                c_use_wb = st.checkbox("WB", value=st.session_state.get("cycle_new_use_wb", False), key="cycle_new_use_wb")
-            with c_wb_in:
-                c_wb = st.number_input("WB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_wb", 50.0 if not USE_SI else 10.0)), step=0.5, key="cycle_new_wb")
-            c_dp_sel, c_dp_in = st.columns([0.25, 0.75])
-            with c_dp_sel:
-                c_use_dp = st.checkbox("DP", value=st.session_state.get("cycle_new_use_dp", False), key="cycle_new_use_dp")
-            with c_dp_in:
-                c_dp = st.number_input("DP (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_dp", 45.0 if not USE_SI else 7.0)), step=0.5, key="cycle_new_dp")
-            c_name = st.text_input("Point name (e.g. Cooling Coil Leaving)", value="", key="cycle_new_name", placeholder="e.g. Coil Leaving")
-            if st.button("Add Point", key="cycle_add_btn"):
-                c_selected = [k for k, v in [("db", c_use_db), ("rh", c_use_rh), ("wb", c_use_wb), ("dp", c_use_dp)] if v]
-                if len(c_selected) != 2:
-                    st.warning("Please select exactly two inputs (DB, RH, WB, DP).")
+            
+            # Unit conversion for adiabatic OA inputs
+            if unit_system_changed:
+                if USE_SI:  # switching to SI
+                    if "adiabatic_oa_db" in st.session_state:
+                        st.session_state["adiabatic_oa_db"] = f_to_c(st.session_state["adiabatic_oa_db"])
+                    if "adiabatic_oa_wb" in st.session_state:
+                        st.session_state["adiabatic_oa_wb"] = f_to_c(st.session_state["adiabatic_oa_wb"])
+                    if "adiabatic_oa_dp" in st.session_state:
+                        st.session_state["adiabatic_oa_dp"] = f_to_c(st.session_state["adiabatic_oa_dp"])
+                else:  # switching to IP
+                    if "adiabatic_oa_db" in st.session_state:
+                        st.session_state["adiabatic_oa_db"] = c_to_f(st.session_state["adiabatic_oa_db"])
+                    if "adiabatic_oa_wb" in st.session_state:
+                        st.session_state["adiabatic_oa_wb"] = c_to_f(st.session_state["adiabatic_oa_wb"])
+                    if "adiabatic_oa_dp" in st.session_state:
+                        st.session_state["adiabatic_oa_dp"] = c_to_f(st.session_state["adiabatic_oa_dp"])
+            
+            oa_db_sel, oa_db_in = st.columns([0.25, 0.75])
+            with oa_db_sel:
+                oa_use_db = st.checkbox("DB", value=st.session_state.get("adiabatic_oa_use_db", True), key="adiabatic_oa_use_db")
+            with oa_db_in:
+                oa_db_adiabatic = st.number_input("OA Dry Bulb (" + TEMP_LABEL + ")", 
+                                                   value=float(st.session_state.get("adiabatic_oa_db", 95.0 if not USE_SI else 35.0)), 
+                                                   step=0.5, key="adiabatic_oa_db")
+            oa_rh_sel, oa_rh_in = st.columns([0.25, 0.75])
+            with oa_rh_sel:
+                oa_use_rh = st.checkbox("RH", value=st.session_state.get("adiabatic_oa_use_rh", True), key="adiabatic_oa_use_rh")
+            with oa_rh_in:
+                oa_rh_adiabatic = st.number_input("OA Relative Humidity (%)", 
+                                                   value=float(st.session_state.get("adiabatic_oa_rh", 40.0)), 
+                                                   step=0.5, min_value=0.0, max_value=100.0, key="adiabatic_oa_rh")
+            oa_wb_sel, oa_wb_in = st.columns([0.25, 0.75])
+            with oa_wb_sel:
+                oa_use_wb = st.checkbox("WB", value=st.session_state.get("adiabatic_oa_use_wb", False), key="adiabatic_oa_use_wb")
+            with oa_wb_in:
+                oa_wb_adiabatic = st.number_input("OA Wet Bulb (" + TEMP_LABEL + ")", 
+                                                   value=float(st.session_state.get("adiabatic_oa_wb", 75.0 if not USE_SI else 24.0)), 
+                                                   step=0.5, key="adiabatic_oa_wb")
+            oa_dp_sel, oa_dp_in = st.columns([0.25, 0.75])
+            with oa_dp_sel:
+                oa_use_dp = st.checkbox("DP", value=st.session_state.get("adiabatic_oa_use_dp", False), key="adiabatic_oa_use_dp")
+            with oa_dp_in:
+                oa_dp_adiabatic = st.number_input("OA Dew Point (" + TEMP_LABEL + ")", 
+                                                   value=float(st.session_state.get("adiabatic_oa_dp", 70.0 if not USE_SI else 21.0)), 
+                                                   step=0.5, key="adiabatic_oa_dp")
+            
+            st.markdown("**Media Settings**")
+            effectiveness = st.slider("Media Effectiveness (%)", 0, 100, 
+                                      int(st.session_state.get("adiabatic_effectiveness", 85)), 
+                                      key="adiabatic_effectiveness")
+            max_rh = st.slider("Max Allowed RH (%)", 50, 100, 
+                               int(st.session_state.get("adiabatic_max_rh", 90)), 
+                               key="adiabatic_max_rh")
+            
+            st.markdown("**Airflow**")
+            if USE_SI:
+                airflow_adiabatic = st.number_input("Airflow (m³/hr)", 
+                                                     value=int(st.session_state.get("adiabatic_airflow", 5000)), 
+                                                     step=500, min_value=100, key="adiabatic_airflow", format="%d")
+            else:
+                airflow_adiabatic = st.number_input("Airflow (CFM)", 
+                                                    value=int(st.session_state.get("adiabatic_airflow", 10000)), 
+                                                    step=500, min_value=100, key="adiabatic_airflow", format="%d")
+            
+            # Calculate adiabatic process (always runs on every rerun)
+            t_min_solve_adiabatic = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
+            t_max_solve_adiabatic = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+            
+            results_oa_adiabatic = None
+            results_supply_adiabatic = None
+            water_consumption = None
+            
+            # Always calculate OA state
+            oa_selected_adiabatic = [k for k, v in [("db", oa_use_db), ("rh", oa_use_rh), ("wb", oa_use_wb), ("dp", oa_use_dp)] if v]
+            oa_inputs_adiabatic = {"db": oa_db_adiabatic if oa_use_db else None, 
+                                   "rh": oa_rh_adiabatic if oa_use_rh else None, 
+                                   "wb": oa_wb_adiabatic if oa_use_wb else None, 
+                                   "dp": oa_dp_adiabatic if oa_use_dp else None}
+            if len(oa_selected_adiabatic) != 2:
+                st.warning("OA: Please select exactly two inputs (DB, RH, WB, DP).")
+                results_oa_adiabatic = None
+            else:
+                try:
+                    results_oa_adiabatic = solve_state_from_two(db=oa_inputs_adiabatic["db"], 
+                                                                 rh=oa_inputs_adiabatic["rh"], 
+                                                                 wb=oa_inputs_adiabatic["wb"], 
+                                                                 dp=oa_inputs_adiabatic["dp"], 
+                                                                 pressure=PRESSURE, 
+                                                                 t_min=t_min_solve_adiabatic, 
+                                                                 t_max=t_max_solve_adiabatic)
+                except Exception as e:
+                    st.error(f"OA state invalid: {e}")
+                    results_oa_adiabatic = None
+            
+            # Calculate supply air state if OA is valid
+            if results_oa_adiabatic:
+                oa_wb = results_oa_adiabatic[KEY_WB]
+                oa_enthalpy = results_oa_adiabatic[KEY_ENTH]
+                
+                # Target DB = OA_DB - (Effectiveness * (OA_DB - OA_WB))
+                target_db = oa_db_adiabatic - (effectiveness / 100.0 * (oa_db_adiabatic - oa_wb))
+                
+                # Find state on constant enthalpy line at target DB
+                try:
+                    results_supply_adiabatic = find_state_on_enthalpy_at_db(oa_enthalpy, target_db, PRESSURE, 
+                                                                             t_min_solve_adiabatic, t_max_solve_adiabatic)
+                except Exception as e:
+                    st.error(f"Error finding state at target DB: {e}")
+                    results_supply_adiabatic = None
+                
+                # Check RH constraint if we have a valid supply state
+                if results_supply_adiabatic:
+                    if results_supply_adiabatic[KEY_RH] > max_rh:
+                        # Find state on constant enthalpy at max RH
+                        try:
+                            supply_at_max_rh = find_state_on_enthalpy_at_rh(oa_enthalpy, max_rh, PRESSURE, 
+                                                                             t_min_solve_adiabatic, t_max_solve_adiabatic)
+                            if supply_at_max_rh:
+                                results_supply_adiabatic = supply_at_max_rh
+                            else:
+                                # If we can't find a state at max RH, keep the target DB state but show a warning
+                                st.warning(f"Could not find state at {max_rh}% RH on constant enthalpy line. Showing state at target DB ({results_supply_adiabatic[KEY_DB]:.1f} {TEMP_LABEL}, {results_supply_adiabatic[KEY_RH]:.1f}% RH) instead.")
+                        except Exception as e:
+                            st.warning(f"Error applying RH constraint: {e}. Showing state at target DB instead.")
+                    
+                    # Calculate water consumption if supply state is valid
+                    delta_hr = results_supply_adiabatic[KEY_HR] - results_oa_adiabatic[KEY_HR]
+                    # Mass flow rate
+                    if USE_SI:
+                        mass_flow = airflow_adiabatic * results_oa_adiabatic[KEY_DENS] / 3600.0  # kg/s
+                        water_flow_kg_s = mass_flow * delta_hr  # kg/s
+                        water_flow_l_min = water_flow_kg_s * 60.0  # L/min (1 kg = 1 L for water)
+                        water_consumption = water_flow_l_min
+                    else:
+                        mass_flow = airflow_adiabatic * results_oa_adiabatic[KEY_DENS]  # lb/min
+                        water_flow_lb_min = mass_flow * delta_hr  # lb/min
+                        water_flow_gpm = water_flow_lb_min / 8.34  # GPM (8.34 lb/gal)
+                        water_consumption = water_flow_gpm
+                    
+                    # Store for plotting (always update on every rerun)
+                    st.session_state["adiabatic_oa_state"] = results_oa_adiabatic
+                    st.session_state["adiabatic_supply_state"] = results_supply_adiabatic
+            
+            # Always display results if available (runs on every rerun)
+            if results_oa_adiabatic and results_supply_adiabatic:
+                st.success("**Supply Air Calculated**")
+                st.metric("Supply DB", f"{results_supply_adiabatic[KEY_DB]:.1f} {TEMP_LABEL}")
+                st.metric("Supply RH", f"{results_supply_adiabatic[KEY_RH]:.1f}%")
+                st.metric("Supply WB", f"{results_supply_adiabatic[KEY_WB]:.1f} {TEMP_LABEL}")
+                if USE_SI:
+                    st.metric("Water Consumption", f"{water_consumption:.2f} L/min")
                 else:
-                    c_inputs = {"db": c_db if c_use_db else None, "rh": c_rh if c_use_rh else None, "wb": c_wb if c_use_wb else None, "dp": c_dp if c_use_dp else None}
+                    st.metric("Water Consumption", f"{water_consumption:.3f} GPM")
+        
+        # Standard Cycle Analysis UI (for Custom, Recirculating CRAH, Economizing AHU)
+        if template != "Adiabatic Cooling":
+            # On unit toggle, convert cycle inputs so thermodynamic values stay the same (e.g. 104°F -> 40°C)
+            if unit_system_changed:
+                if USE_SI:  # switching to SI: convert stored IP values to SI
+                    st.session_state["cycle_ra_db"] = f_to_c(st.session_state["cycle_ra_db"])
+                    st.session_state["cycle_oa_db"] = f_to_c(st.session_state["cycle_oa_db"])
+                    if "cycle_ra_wb" in st.session_state:
+                        st.session_state["cycle_ra_wb"] = f_to_c(st.session_state["cycle_ra_wb"])
+                    if "cycle_ra_dp" in st.session_state:
+                        st.session_state["cycle_ra_dp"] = f_to_c(st.session_state["cycle_ra_dp"])
+                    if "cycle_oa_wb" in st.session_state:
+                        st.session_state["cycle_oa_wb"] = f_to_c(st.session_state["cycle_oa_wb"])
+                    if "cycle_oa_dp" in st.session_state:
+                        st.session_state["cycle_oa_dp"] = f_to_c(st.session_state["cycle_oa_dp"])
+                    st.session_state["cycle_total_airflow"] = int(round(cfm_to_m3_hr(st.session_state["cycle_total_airflow"])))
+                    if "cycle_new_db" in st.session_state:
+                        st.session_state["cycle_new_db"] = f_to_c(st.session_state["cycle_new_db"])
+                    if "cycle_new_wb" in st.session_state:
+                        st.session_state["cycle_new_wb"] = f_to_c(st.session_state["cycle_new_wb"])
+                    if "cycle_new_dp" in st.session_state:
+                        st.session_state["cycle_new_dp"] = f_to_c(st.session_state["cycle_new_dp"])
+                    o_db, o_wb, o_dp = "Dry Bulb (°F)", "Wet Bulb (°F)", "Dew Point (°F)"
+                    o_enth, o_vol, o_dens = "Enthalpy (Btu/lb)", "Specific Vol (ft³/lb)", "Moist Air Density (lb/ft³)"
+                    o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (lb/lb)"
+                    for pt in st.session_state.get("cycle_points", []):
+                        s = pt["state"]
+                        pt["state"] = {
+                            KEY_DB: f_to_c(s[o_db]), KEY_WB: f_to_c(s[o_wb]), KEY_DP: f_to_c(s[o_dp]),
+                            KEY_RH: s[o_rh], KEY_HR: s[o_hr],
+                            KEY_ENTH: btu_lb_to_j_kg(s[o_enth]),
+                            KEY_VOL: s[o_vol] * 0.062428, KEY_DENS: s[o_dens] * 16.0185,
+                        }
+                else:  # switching to IP: convert stored SI values to IP
+                    st.session_state["cycle_ra_db"] = c_to_f(st.session_state["cycle_ra_db"])
+                    st.session_state["cycle_oa_db"] = c_to_f(st.session_state["cycle_oa_db"])
+                    if "cycle_ra_wb" in st.session_state:
+                        st.session_state["cycle_ra_wb"] = c_to_f(st.session_state["cycle_ra_wb"])
+                    if "cycle_ra_dp" in st.session_state:
+                        st.session_state["cycle_ra_dp"] = c_to_f(st.session_state["cycle_ra_dp"])
+                    if "cycle_oa_wb" in st.session_state:
+                        st.session_state["cycle_oa_wb"] = c_to_f(st.session_state["cycle_oa_wb"])
+                    if "cycle_oa_dp" in st.session_state:
+                        st.session_state["cycle_oa_dp"] = c_to_f(st.session_state["cycle_oa_dp"])
+                    st.session_state["cycle_total_airflow"] = int(round(m3_hr_to_cfm(st.session_state["cycle_total_airflow"])))
+                    if "cycle_new_db" in st.session_state:
+                        st.session_state["cycle_new_db"] = c_to_f(st.session_state["cycle_new_db"])
+                    if "cycle_new_wb" in st.session_state:
+                        st.session_state["cycle_new_wb"] = c_to_f(st.session_state["cycle_new_wb"])
+                    if "cycle_new_dp" in st.session_state:
+                        st.session_state["cycle_new_dp"] = c_to_f(st.session_state["cycle_new_dp"])
+                    o_db, o_wb, o_dp = "Dry Bulb (°C)", "Wet Bulb (°C)", "Dew Point (°C)"
+                    o_enth, o_vol, o_dens = "Enthalpy (J/kg)", "Specific Vol (m³/kg)", "Moist Air Density (kg/m³)"
+                    o_rh, o_hr = "Relative Humidity (%)", "Humidity Ratio (kg/kg)"
+                    for pt in st.session_state.get("cycle_points", []):
+                        s = pt["state"]
+                        pt["state"] = {
+                            KEY_DB: c_to_f(s[o_db]), KEY_WB: c_to_f(s[o_wb]), KEY_DP: c_to_f(s[o_dp]),
+                            KEY_RH: s[o_rh], KEY_HR: s[o_hr],
+                            KEY_ENTH: j_kg_to_btu_lb(s[o_enth]),
+                            KEY_VOL: s[o_vol] / 0.062428, KEY_DENS: s[o_dens] / 16.0185,
+                        }
+
+            st.markdown("**Mixing Box**")
+            if USE_SI:
+                total_airflow = st.number_input("Total System Airflow (m³/hr)", value=int(st.session_state.get("cycle_total_airflow", 5000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
+            else:
+                total_airflow = st.number_input("Total System Airflow (CFM)", value=int(st.session_state.get("cycle_total_airflow", 10000)), step=500, min_value=100, key="cycle_total_airflow", format="%d")
+            
+            # Hide OA slider for Recirculating CRAH (always 0% OA)
+            if template != "Recirculating CRAH":
+                pct_oa = st.slider("% Outside Air", 0, 100, int(st.session_state.get("cycle_pct_oa", 20)), key="cycle_pct_oa")
+            else:
+                pct_oa = 0.0
+                st.session_state["cycle_pct_oa"] = 0.0
+            
+            st.markdown("**Return Air (RA)**")
+            st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
+            ra_db_sel, ra_db_in = st.columns([0.25, 0.75])
+            with ra_db_sel:
+                ra_use_db = st.checkbox("DB", value=st.session_state.get("cycle_ra_use_db", True), key="cycle_ra_use_db")
+            with ra_db_in:
+                ra_db = st.number_input("RA Dry Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_ra_db", 75.0 if not USE_SI else 24.0)), step=0.5, key="cycle_ra_db")
+            ra_rh_sel, ra_rh_in = st.columns([0.25, 0.75])
+            with ra_rh_sel:
+                ra_use_rh = st.checkbox("RH", value=st.session_state.get("cycle_ra_use_rh", True), key="cycle_ra_use_rh")
+            with ra_rh_in:
+                ra_rh = st.number_input("RA Relative Humidity (%)", value=float(st.session_state.get("cycle_ra_rh", 50.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_ra_rh")
+            ra_wb_sel, ra_wb_in = st.columns([0.25, 0.75])
+            with ra_wb_sel:
+                ra_use_wb = st.checkbox("WB", value=st.session_state.get("cycle_ra_use_wb", False), key="cycle_ra_use_wb")
+            with ra_wb_in:
+                ra_wb = st.number_input("RA Wet Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_ra_wb", 65.0 if not USE_SI else 18.0)), step=0.5, key="cycle_ra_wb")
+            ra_dp_sel, ra_dp_in = st.columns([0.25, 0.75])
+            with ra_dp_sel:
+                ra_use_dp = st.checkbox("DP", value=st.session_state.get("cycle_ra_use_dp", False), key="cycle_ra_use_dp")
+            with ra_dp_in:
+                ra_dp = st.number_input("RA Dew Point (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_ra_dp", 55.0 if not USE_SI else 13.0)), step=0.5, key="cycle_ra_dp")
+            
+            # Hide OA inputs for Recirculating CRAH (no outside air)
+            if template != "Recirculating CRAH":
+                st.markdown("**Outside Air (OA)**")
+                st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
+                oa_db_sel, oa_db_in = st.columns([0.25, 0.75])
+                with oa_db_sel:
+                    oa_use_db = st.checkbox("DB", value=st.session_state.get("cycle_oa_use_db", True), key="cycle_oa_use_db")
+                with oa_db_in:
+                    oa_db = st.number_input("OA Dry Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_oa_db", 95.0 if not USE_SI else 35.0)), step=0.5, key="cycle_oa_db")
+                oa_rh_sel, oa_rh_in = st.columns([0.25, 0.75])
+                with oa_rh_sel:
+                    oa_use_rh = st.checkbox("RH", value=st.session_state.get("cycle_oa_use_rh", True), key="cycle_oa_use_rh")
+                with oa_rh_in:
+                    oa_rh = st.number_input("OA Relative Humidity (%)", value=float(st.session_state.get("cycle_oa_rh", 40.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_oa_rh")
+                oa_wb_sel, oa_wb_in = st.columns([0.25, 0.75])
+                with oa_wb_sel:
+                    oa_use_wb = st.checkbox("WB", value=st.session_state.get("cycle_oa_use_wb", False), key="cycle_oa_use_wb")
+                with oa_wb_in:
+                    oa_wb = st.number_input("OA Wet Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_oa_wb", 75.0 if not USE_SI else 24.0)), step=0.5, key="cycle_oa_wb")
+                oa_dp_sel, oa_dp_in = st.columns([0.25, 0.75])
+                with oa_dp_sel:
+                    oa_use_dp = st.checkbox("DP", value=st.session_state.get("cycle_oa_use_dp", False), key="cycle_oa_use_dp")
+                with oa_dp_in:
+                    oa_dp = st.number_input("OA Dew Point (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_oa_dp", 70.0 if not USE_SI else 21.0)), step=0.5, key="cycle_oa_dp")
+            else:
+                # Recirculating CRAH: no OA inputs, set OA to None
+                oa_use_db = oa_use_rh = oa_use_wb = oa_use_dp = False
+                oa_db = oa_rh = oa_wb = oa_dp = None
+            
+            # For Recirculating CRAH or Economizing AHU, add editable inputs for cycle points (below RA/OA)
+            if template == "Recirculating CRAH" or template == "Economizing AHU":
+                cycle_points = st.session_state.get("cycle_points", [])
+                cycle_points_updated = []
+                pt_key_base = "cycle_pt_recirc_" if template == "Recirculating CRAH" else "cycle_pt_econ_"
+                
+                for idx, pt in enumerate(cycle_points):
+                    pt_name = pt["name"]
+                    pt_state = pt["state"]
+                    pt_key_prefix = f"{pt_key_base}{idx}_"
+                    
+                    # Initialize session state for this point's inputs if needed (before any widget)
+                    if pt_key_prefix + "db" not in st.session_state:
+                        st.session_state[pt_key_prefix + "db"] = pt_state[KEY_DB]
+                        st.session_state[pt_key_prefix + "rh"] = pt_state[KEY_RH]
+                        st.session_state[pt_key_prefix + "wb"] = pt_state[KEY_WB]
+                        st.session_state[pt_key_prefix + "dp"] = pt_state[KEY_DP]
+                        st.session_state[pt_key_prefix + "use_db"] = True
+                        st.session_state[pt_key_prefix + "use_rh"] = True
+                        st.session_state[pt_key_prefix + "use_wb"] = False
+                        st.session_state[pt_key_prefix + "use_dp"] = False
+                    
+                    st.markdown(f"**{pt_name}**")
+                    st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
+                    
+                    pt_db_sel, pt_db_in = st.columns([0.25, 0.75])
+                    with pt_db_sel:
+                        pt_use_db = st.checkbox("DB", value=st.session_state.get(pt_key_prefix + "use_db", True), key=pt_key_prefix + "use_db")
+                    with pt_db_in:
+                        pt_db = st.number_input(f"{pt_name} Dry Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get(pt_key_prefix + "db", pt_state[KEY_DB])), step=0.5, key=pt_key_prefix + "db")
+                    
+                    pt_rh_sel, pt_rh_in = st.columns([0.25, 0.75])
+                    with pt_rh_sel:
+                        pt_use_rh = st.checkbox("RH", value=st.session_state.get(pt_key_prefix + "use_rh", True), key=pt_key_prefix + "use_rh")
+                    with pt_rh_in:
+                        pt_rh = st.number_input(f"{pt_name} Relative Humidity (%)", value=float(st.session_state.get(pt_key_prefix + "rh", pt_state[KEY_RH])), step=0.5, min_value=0.0, max_value=100.0, key=pt_key_prefix + "rh")
+                    
+                    pt_wb_sel, pt_wb_in = st.columns([0.25, 0.75])
+                    with pt_wb_sel:
+                        pt_use_wb = st.checkbox("WB", value=st.session_state.get(pt_key_prefix + "use_wb", False), key=pt_key_prefix + "use_wb")
+                    with pt_wb_in:
+                        pt_wb = st.number_input(f"{pt_name} Wet Bulb (" + TEMP_LABEL + ")", value=float(st.session_state.get(pt_key_prefix + "wb", pt_state[KEY_WB])), step=0.5, key=pt_key_prefix + "wb")
+                    
+                    pt_dp_sel, pt_dp_in = st.columns([0.25, 0.75])
+                    with pt_dp_sel:
+                        pt_use_dp = st.checkbox("DP", value=st.session_state.get(pt_key_prefix + "use_dp", False), key=pt_key_prefix + "use_dp")
+                    with pt_dp_in:
+                        pt_dp = st.number_input(f"{pt_name} Dew Point (" + TEMP_LABEL + ")", value=float(st.session_state.get(pt_key_prefix + "dp", pt_state[KEY_DP])), step=0.5, key=pt_key_prefix + "dp")
+                    
+                    # Calculate updated state from inputs
+                    pt_selected = [k for k, v in [("db", pt_use_db), ("rh", pt_use_rh), ("wb", pt_use_wb), ("dp", pt_use_dp)] if v]
+                    pt_inputs = {"db": pt_db if pt_use_db else None, "rh": pt_rh if pt_use_rh else None, "wb": pt_wb if pt_use_wb else None, "dp": pt_dp if pt_use_dp else None}
+                    
+                    t_min_solve_pt = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
+                    t_max_solve_pt = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+                    
+                    if len(pt_selected) != 2:
+                        st.warning(f"{pt_name}: Please select exactly two inputs (DB, RH, WB, DP).")
+                        cycle_points_updated.append(pt)
+                    else:
+                        try:
+                            updated_state = solve_state_from_two(db=pt_inputs["db"], rh=pt_inputs["rh"], wb=pt_inputs["wb"], dp=pt_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve_pt, t_max=t_max_solve_pt)
+                            cycle_points_updated.append({"name": pt_name, "state": updated_state})
+                        except Exception as e:
+                            st.error(f"{pt_name} state invalid: {e}")
+                            cycle_points_updated.append(pt)
+                
+                # Update cycle_points in session state (chart/table use this; widget keys are user-driven)
+                st.session_state["cycle_points"] = cycle_points_updated
+
+            t_min_solve = (chart_t_min - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_min
+            t_max_solve = (chart_t_max - 32.0) * 5.0 / 9.0 if USE_SI else chart_t_max
+            results_ra = None
+            results_oa = None
+            results_ma = None
+            
+            # Validate RA inputs
+            ra_selected = [k for k, v in [("db", ra_use_db), ("rh", ra_use_rh), ("wb", ra_use_wb), ("dp", ra_use_dp)] if v]
+            ra_inputs = {"db": ra_db if ra_use_db else None, "rh": ra_rh if ra_use_rh else None, "wb": ra_wb if ra_use_wb else None, "dp": ra_dp if ra_use_dp else None}
+            if len(ra_selected) != 2:
+                st.warning("RA: Please select exactly two inputs (DB, RH, WB, DP).")
+            else:
+                try:
+                    results_ra = solve_state_from_two(db=ra_inputs["db"], rh=ra_inputs["rh"], wb=ra_inputs["wb"], dp=ra_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+                except Exception as e:
+                    st.error(f"RA state invalid: {e}")
+            
+            # Validate OA inputs (only if not Recirculating CRAH)
+            if template != "Recirculating CRAH":
+                oa_selected = [k for k, v in [("db", oa_use_db), ("rh", oa_use_rh), ("wb", oa_use_wb), ("dp", oa_use_dp)] if v]
+                oa_inputs = {"db": oa_db if oa_use_db else None, "rh": oa_rh if oa_use_rh else None, "wb": oa_wb if oa_use_wb else None, "dp": oa_dp if oa_use_dp else None}
+                if len(oa_selected) != 2:
+                    st.warning("OA: Please select exactly two inputs (DB, RH, WB, DP).")
+                else:
                     try:
-                        pt_state = solve_state_from_two(db=c_inputs["db"], rh=c_inputs["rh"], wb=c_inputs["wb"], dp=c_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
-                        name = c_name.strip() or f"Point {len(cycle_points)+1}"
-                        cycle_points = st.session_state.get("cycle_points", []) + [{"name": name, "state": pt_state}]
-                        st.session_state["cycle_points"] = cycle_points[:3]
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(f"Invalid state: {ex}")
-        for i, pt in enumerate(cycle_points):
-            cols = st.columns([1, 0.15])
-            with cols[0]:
-                st.caption(f"{pt['name']}: DB={pt['state'][KEY_DB]:.1f}, WB={pt['state'][KEY_WB]:.1f}")
-            with cols[1]:
-                if st.button("X", key=f"cycle_del_{i}"):
-                    cycle_points = st.session_state.get("cycle_points", [])
-                    cycle_points.pop(i)
-                    st.session_state["cycle_points"] = cycle_points
-                    st.rerun()
-        results_1 = None
-        results_2 = None
-        st.session_state["cycle_ra"] = results_ra
-        st.session_state["cycle_oa"] = results_oa
-        st.session_state["cycle_ma"] = results_ma
+                        results_oa = solve_state_from_two(db=oa_inputs["db"], rh=oa_inputs["rh"], wb=oa_inputs["wb"], dp=oa_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+                    except Exception as e:
+                        st.error(f"OA state invalid: {e}")
+            
+            # Calculate mixed air
+            if template == "Recirculating CRAH":
+                # For Recirculating CRAH, mixed air = RA (no mixing, no OA)
+                if results_ra is not None:
+                    results_ma = results_ra
+                    st.success("Recirculating System - 100% Return Air")
+                    st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+            elif results_ra is not None and results_oa is not None:
+                if pct_oa >= 99.5:
+                    results_ma = results_oa
+                    st.success("100% Outside Air - no mixing")
+                    st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+                elif pct_oa <= 0.5:
+                    results_ma = results_ra
+                    st.success("100% Return Air - no mixing")
+                    st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+                else:
+                    airflow_oa = total_airflow * (pct_oa / 100.0)
+                    airflow_ra = total_airflow * (1.0 - pct_oa / 100.0)
+                    if USE_SI:
+                        mass_oa = airflow_oa * results_oa[KEY_DENS] / 3600.0
+                        mass_ra = airflow_ra * results_ra[KEY_DENS] / 3600.0
+                    else:
+                        mass_oa = airflow_oa * results_oa[KEY_DENS]
+                        mass_ra = airflow_ra * results_ra[KEY_DENS]
+                    tot_mass = mass_oa + mass_ra
+                    if tot_mass > 0:
+                        h_mix = (mass_oa * results_oa[KEY_ENTH] + mass_ra * results_ra[KEY_ENTH]) / tot_mass
+                        w_mix = (mass_oa * results_oa[KEY_HR] + mass_ra * results_ra[KEY_HR]) / tot_mass
+                        try:
+                            results_ma = solve_state_from_enthalpy_humratio(h_mix, w_mix, PRESSURE, t_min_solve, t_max_solve)
+                        except Exception:
+                            results_ma = None
+                    if results_ma is not None:
+                        st.success("Mixed Air Result")
+                        st.caption(f"DB: {results_ma[KEY_DB]:.1f} {TEMP_LABEL}  |  WB: {results_ma[KEY_WB]:.1f} {TEMP_LABEL}  |  h: {results_ma[KEY_ENTH]:.1f} {ENTHALPY_LABEL}")
+
+            st.divider()
+            st.markdown("**Process Chain**")
+            cycle_points = st.session_state.get("cycle_points", [])
+            # For Recirculating CRAH and Economizing AHU, points are edited above; only show add/remove for Custom
+            show_process_chain_edit = (template != "Recirculating CRAH" and template != "Economizing AHU")
+            if show_process_chain_edit and len(cycle_points) < 3:
+                st.markdown("Add next component (leaving state):")
+                st.caption("Select **exactly two** of the four state inputs (DB, RH, WB, DP).")
+                c_db_sel, c_db_in = st.columns([0.25, 0.75])
+                with c_db_sel:
+                    c_use_db = st.checkbox("DB", value=st.session_state.get("cycle_new_use_db", True), key="cycle_new_use_db")
+                with c_db_in:
+                    c_db = st.number_input("DB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_db", 55.0 if not USE_SI else 13.0)), step=0.5, key="cycle_new_db")
+                c_rh_sel, c_rh_in = st.columns([0.25, 0.75])
+                with c_rh_sel:
+                    c_use_rh = st.checkbox("RH", value=st.session_state.get("cycle_new_use_rh", True), key="cycle_new_use_rh")
+                with c_rh_in:
+                    c_rh = st.number_input("RH (%)", value=float(st.session_state.get("cycle_new_rh", 90.0)), step=0.5, min_value=0.0, max_value=100.0, key="cycle_new_rh")
+                c_wb_sel, c_wb_in = st.columns([0.25, 0.75])
+                with c_wb_sel:
+                    c_use_wb = st.checkbox("WB", value=st.session_state.get("cycle_new_use_wb", False), key="cycle_new_use_wb")
+                with c_wb_in:
+                    c_wb = st.number_input("WB (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_wb", 50.0 if not USE_SI else 10.0)), step=0.5, key="cycle_new_wb")
+                c_dp_sel, c_dp_in = st.columns([0.25, 0.75])
+                with c_dp_sel:
+                    c_use_dp = st.checkbox("DP", value=st.session_state.get("cycle_new_use_dp", False), key="cycle_new_use_dp")
+                with c_dp_in:
+                    c_dp = st.number_input("DP (" + TEMP_LABEL + ")", value=float(st.session_state.get("cycle_new_dp", 45.0 if not USE_SI else 7.0)), step=0.5, key="cycle_new_dp")
+                c_name = st.text_input("Point name (e.g. Cooling Coil Leaving)", value="", key="cycle_new_name", placeholder="e.g. Coil Leaving")
+                if st.button("Add Point", key="cycle_add_btn"):
+                    c_selected = [k for k, v in [("db", c_use_db), ("rh", c_use_rh), ("wb", c_use_wb), ("dp", c_use_dp)] if v]
+                    if len(c_selected) != 2:
+                        st.warning("Please select exactly two inputs (DB, RH, WB, DP).")
+                    else:
+                        c_inputs = {"db": c_db if c_use_db else None, "rh": c_rh if c_use_rh else None, "wb": c_wb if c_use_wb else None, "dp": c_dp if c_use_dp else None}
+                        try:
+                            pt_state = solve_state_from_two(db=c_inputs["db"], rh=c_inputs["rh"], wb=c_inputs["wb"], dp=c_inputs["dp"], pressure=PRESSURE, t_min=t_min_solve, t_max=t_max_solve)
+                            name = c_name.strip() or f"Point {len(cycle_points)+1}"
+                            cycle_points = st.session_state.get("cycle_points", []) + [{"name": name, "state": pt_state}]
+                            st.session_state["cycle_points"] = cycle_points[:3]
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Invalid state: {ex}")
+            if show_process_chain_edit:
+                for i, pt in enumerate(cycle_points):
+                    cols = st.columns([1, 0.15])
+                    with cols[0]:
+                        st.caption(f"{pt['name']}: DB={pt['state'][KEY_DB]:.1f}, WB={pt['state'][KEY_WB]:.1f}")
+                    with cols[1]:
+                        if st.button("X", key=f"cycle_del_{i}"):
+                            cycle_points = st.session_state.get("cycle_points", [])
+                            cycle_points.pop(i)
+                            st.session_state["cycle_points"] = cycle_points
+                            st.rerun()
+            results_1 = None
+            results_2 = None
+            st.session_state["cycle_ra"] = results_ra
+            st.session_state["cycle_oa"] = results_oa
+            st.session_state["cycle_ma"] = results_ma
     else:
         if mode != "Markup":
             st.markdown("Select **exactly two** of the four state inputs:")
@@ -943,8 +1628,9 @@ with col1:
                 airflow_type_1 = st.radio("", ["ACFM", "SCFM"], index=0, key="airflow_type_1", horizontal=True, label_visibility="collapsed")
     
         # Display mass flow below airflow input (updated after Point 1 is solved)
+        # In Air Mixing mode, hide this standalone block; airflow/mass flow stay in the three-column summary only
         mass_flow_1_display = st.session_state.get("mass_flow_1_display", None)
-        if mass_flow_1_display is not None:
+        if mass_flow_1_display is not None and mode != "Air Mixing":
             if USE_SI:
                 st.caption(f":gray[Mass Flow: {mass_flow_1_display:.3f} kg/s]")
             else:
@@ -1126,9 +1812,9 @@ with col1:
                     # Display airflow as a property
                     if USE_SI:
                         st.metric("Airflow", f"{format_airflow(airflow_1)} m³/hr")
-                else:
-                    airflow_label = f"{format_airflow(airflow_1)} {airflow_type_1}" if airflow_type_1 else f"{format_airflow(airflow_1)} CFM"
-                    st.metric("Airflow", airflow_label)
+                    else:
+                        airflow_label = f"{format_airflow(airflow_1)} {airflow_type_1}" if airflow_type_1 else f"{format_airflow(airflow_1)} CFM"
+                        st.metric("Airflow", airflow_label)
                 
                 # Display mass flow for Point 1 (below airflow)
                 mass_flow_1 = calculate_mass_flow(airflow_1, airflow_type_1, results_1)
@@ -1211,6 +1897,8 @@ with col2:
         sat_temps, sat_hr = get_saturation_curve(chart_T_min, chart_T_max, PRESSURE, step=0.5)
         T_MIN, T_MAX = sat_temps[0], sat_temps[-1]
         P = PRESSURE
+        # Envelope polygons use psychrolib in SI (expect pressure in Pa)
+        P_pa = PRESSURE if USE_SI else (PRESSURE * 6894.75729)
         
         # Use natural saturation curve from psychrolib (already smooth and thermodynamically correct)
         # Removed shape adjustment to maintain natural smooth curve appearance
@@ -1322,6 +2010,146 @@ with col2:
     
         # Create Plotly Figure (visuals match reference: order and styles)
         fig = go.Figure()
+        
+        # 0. Weather Frequency Heatmap (if enabled) - add FIRST so it's behind all other traces
+        # Note: y_scale is defined later, but we need it here. We'll calculate it now.
+        use_grains = st.session_state.get("hr_grains_toggle", False)
+        y_scale = (7000.0 if use_grains else 1.0) if not USE_SI else 1.0
+        
+        if st.session_state.get("show_weather_heatmap", False) and "weather_data" in st.session_state:
+            weather_data_list = st.session_state.get("weather_data", [])
+            if len(weather_data_list) > 0:
+                # Extract dry bulb and humidity ratio arrays
+                db_array = np.array([d[0] for d in weather_data_list])
+                hr_array_raw = np.array([d[1] for d in weather_data_list])
+                
+                # Scale humidity ratios for y-axis (same scaling as other traces)
+                hr_array = hr_array_raw * y_scale
+                
+                # Set bin sizes based on unit system
+                if USE_SI:
+                    db_bin_size = 1.0  # °C
+                    hr_bin_size = 0.0004 * y_scale  # kg/kg scaled
+                else:
+                    db_bin_size = 2.0  # °F
+                    hr_bin_size = 0.0005 * y_scale  # lb/lb scaled
+                
+                # Get opacity from slider
+                opacity = st.session_state.get("heatmap_opacity", 0.6)
+                
+                # Custom colorscale: 0 hours -> fully transparent; 1+ hours -> Spectral_r (blue=low, red=high)
+                # So bins with no data show no color and the chart grid shows through
+                weather_colorscale = [
+                    [0.0, "rgba(0,0,0,0)"],
+                    [1e-9, "rgb(94,79,162)"],
+                    [0.2, "rgb(78,154,174)"],
+                    [0.4, "rgb(254,224,144)"],
+                    [0.6, "rgb(253,174,97)"],
+                    [0.8, "rgb(244,109,67)"],
+                    [1.0, "rgb(158,1,66)"],
+                ]
+                
+                # Create Histogram2d trace
+                fig.add_trace(go.Histogram2d(
+                    x=db_array,
+                    y=hr_array,
+                    autobinx=False,
+                    autobiny=False,
+                    xbins=dict(
+                        start=float(T_MIN),
+                        end=float(T_MAX),
+                        size=db_bin_size
+                    ),
+                    ybins=dict(
+                        start=0.0,
+                        end=float(max_hr * y_scale),
+                        size=hr_bin_size
+                    ),
+                    colorscale=weather_colorscale,
+                    zmin=0,  # so 0-hour bins map to first (transparent) color
+                    zsmooth=False,  # Blocky pixelated look, not blurred
+                    showscale=True,
+                    colorbar=dict(
+                        title="Hours",
+                        x=0.02,
+                        y=0.78,
+                        xanchor="left",
+                        yanchor="top",
+                        len=0.22,
+                        thickness=14,
+                    ),
+                    opacity=opacity,
+                    name="Weather Frequency",
+                    showlegend=False,
+                    hoverinfo='skip'
+                ))
+        
+        # 0b. Envelope overlays (after weather bin, before grid lines)
+        envelope_colors = {
+            "TC 9.9 Recommended": "rgba(0, 128, 0, 0.35)",
+            "TC 9.9 Allowable A1": "rgba(255, 165, 0, 0.35)",
+            "ASHRAE 55 Summer": "rgba(70, 130, 180, 0.35)",
+            "ASHRAE 55 Winter": "rgba(100, 149, 237, 0.35)",
+            "Custom": "rgba(128, 128, 128, 0.35)",
+        }
+        selected_envelopes = st.session_state.get("show_envelopes", [])
+        if selected_envelopes and "None" not in selected_envelopes:
+            for env_name in selected_envelopes:
+                if env_name == "Custom":
+                    # Build Custom polygon from session state; all psychrolib in SI
+                    try:
+                        db_lo = st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 64.0)
+                        db_hi = st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 80.0)
+                        if not USE_SI:
+                            db_lo, db_hi = f_to_c(db_lo), f_to_c(db_hi)
+                        use_rh = st.session_state.get("envelope_custom_use_rh", True)
+                        psychrolib.SetUnitSystem(psychrolib.SI)
+                        if use_rh:
+                            rh_lo = st.session_state.get("envelope_custom_rh_min", 20.0) / 100.0
+                            rh_hi = st.session_state.get("envelope_custom_rh_max", 60.0) / 100.0
+                            w_ll = psychrolib.GetHumRatioFromRelHum(db_lo, rh_lo, P_pa)
+                            w_lh = psychrolib.GetHumRatioFromRelHum(db_lo, rh_hi, P_pa)
+                            w_hl = psychrolib.GetHumRatioFromRelHum(db_hi, rh_lo, P_pa)
+                            w_hh = psychrolib.GetHumRatioFromRelHum(db_hi, rh_hi, P_pa)
+                        else:
+                            dp_lo = st.session_state.get("envelope_custom_dp_min", 5.0)
+                            dp_hi = st.session_state.get("envelope_custom_dp_max", 15.0)
+                            if not USE_SI:
+                                dp_lo, dp_hi = f_to_c(dp_lo), f_to_c(dp_hi)
+                            w_ll = psychrolib.GetHumRatioFromTDewPoint(dp_lo, P_pa)
+                            w_lh = psychrolib.GetHumRatioFromTDewPoint(dp_hi, P_pa)
+                            w_hl, w_hh = w_ll, w_lh
+                        pts_si = [(db_lo, w_ll), (db_hi, w_hl), (db_hi, w_hh), (db_lo, w_lh), (db_lo, w_ll)]
+                        psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
+                    except Exception:
+                        try:
+                            psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
+                        except Exception:
+                            pass
+                        pts_si = []
+                else:
+                    pts_si = get_envelope_polygon(env_name, P_pa)
+                if not pts_si:
+                    continue
+                # Convert to chart units
+                if USE_SI:
+                    xs = [p[0] for p in pts_si]
+                    ys = [p[1] * y_scale for p in pts_si]
+                else:
+                    xs = [c_to_f(p[0]) for p in pts_si]
+                    ys = [p[1] * y_scale for p in pts_si]
+                fig.add_trace(go.Scatter(
+                    x=xs,
+                    y=ys,
+                    fill='toself',
+                    mode='lines',
+                    line=dict(width=1.5, color=envelope_colors.get(env_name, "rgba(128,128,128,0.35)").replace("0.35", "0.9")),
+                    fillcolor=envelope_colors.get(env_name, "rgba(128,128,128,0.35)"),
+                    name=env_name,
+                    showlegend=True,
+                    legendgroup=env_name,
+                    hoverinfo='skip',
+                ))
     
         # 1. Dry Bulb grid lines - darker every 5°F, lighter every 1°F
         for db in range(int(T_MIN), int(T_MAX) + 1, 1):
@@ -2190,107 +3018,238 @@ with col2:
             results = None  # Not used in mixing mode
     
         elif mode == "Cycle Analysis":
-            results_ra = st.session_state.get("cycle_ra")
-            results_oa = st.session_state.get("cycle_oa")
-            results_ma = st.session_state.get("cycle_ma")
-            cycle_points = st.session_state.get("cycle_points", [])
-            pct_oa = st.session_state.get("cycle_pct_oa", 20.0)
-            if results_ma is not None:
-                hr_ra = (results_ra[KEY_HR] * y_scale) if results_ra is not None else None
-                hr_oa = (results_oa[KEY_HR] * y_scale) if results_oa is not None else None
-                hr_ma = results_ma[KEY_HR] * y_scale
-                # 100% OA: only OA visible; OA is the start of the chain. 0% OA: only RA visible; RA is the start.
-                if pct_oa >= 99.5:
-                    pts_x = [results_oa[KEY_DB]]
-                    pts_y = [hr_oa]
-                    for pt in cycle_points:
-                        pts_x.append(pt["state"][KEY_DB])
-                        pts_y.append(pt["state"][KEY_HR] * y_scale)
-                    if len(pts_x) > 1:
-                        fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+            template = st.session_state.get("cycle_template", "Custom")
+            
+            # Adiabatic Cooling mode: plot OA and Supply Air
+            if template == "Adiabatic Cooling":
+                oa_state = st.session_state.get("adiabatic_oa_state")
+                supply_state = st.session_state.get("adiabatic_supply_state")
+                
+                if oa_state and supply_state:
+                    hr_unit = "gr/lb" if (not USE_SI and use_grains) else ("kg/kg" if USE_SI else "lb/lb")
+                    
+                    # OA point (green)
+                    hr_oa_adiabatic = oa_state[KEY_HR]
+                    hr_display_oa = (hr_oa_adiabatic * 7000.0 if use_grains else hr_oa_adiabatic) if not USE_SI else hr_oa_adiabatic
+                    oa_customdata = [[
+                        oa_state[KEY_DB],
+                        hr_display_oa,
+                        oa_state[KEY_RH],
+                        oa_state[KEY_WB],
+                        oa_state[KEY_DP],
+                        oa_state[KEY_ENTH],
+                    ]]
+                    oa_hover = (
+                        "OA<br>"
+                        f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                        f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                        "RH: %{customdata[2]:.2f} %<br>"
+                        f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                        f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                        f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                        "<extra></extra>"
+                    )
+                    
                     fig.add_trace(go.Scatter(
-                        x=[results_oa[KEY_DB]], y=[hr_oa],
-                        mode='markers+text', text=['Outside Air'], textposition='top center',
-                        marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                        x=[oa_state[KEY_DB]],
+                        y=[hr_oa_adiabatic * y_scale],
+                        mode='markers+text',
+                        name='OA',
+                        showlegend=False,
+                        text=['OA'],
+                        textposition="top center",
+                        marker=dict(size=12, color='green', symbol='square'),
+                        customdata=oa_customdata,
+                        hovertemplate=oa_hover,
+                        hoverlabel=dict(
+                            bgcolor="#ccffcc",
+                            font_color=hover_font_color,
+                        ),
                     ))
-                elif pct_oa <= 0.5:
+                    
+                    # Supply Air point (blue)
+                    hr_supply_adiabatic = supply_state[KEY_HR]
+                    hr_display_supply = (hr_supply_adiabatic * 7000.0 if use_grains else hr_supply_adiabatic) if not USE_SI else hr_supply_adiabatic
+                    supply_customdata = [[
+                        supply_state[KEY_DB],
+                        hr_display_supply,
+                        supply_state[KEY_RH],
+                        supply_state[KEY_WB],
+                        supply_state[KEY_DP],
+                        supply_state[KEY_ENTH],
+                    ]]
+                    supply_hover = (
+                        "Supply Air<br>"
+                        f"DB: %{{customdata[0]:.2f}} {TEMP_LABEL}<br>"
+                        f"HR: %{{customdata[1]:.2f}} {hr_unit}<br>"
+                        "RH: %{customdata[2]:.2f} %<br>"
+                        f"WB: %{{customdata[3]:.2f}} {TEMP_LABEL}<br>"
+                        f"DP: %{{customdata[4]:.2f}} {TEMP_LABEL}<br>"
+                        f"h: %{{customdata[5]:.2f}} {ENTHALPY_LABEL}<br>"
+                        "<extra></extra>"
+                    )
+                    
+                    fig.add_trace(go.Scatter(
+                        x=[supply_state[KEY_DB]],
+                        y=[hr_supply_adiabatic * y_scale],
+                        mode='markers+text',
+                        name='Supply Air',
+                        showlegend=False,
+                        text=['Supply Air'],
+                        textposition="top center",
+                        marker=dict(size=12, color='blue', symbol='circle'),
+                        customdata=supply_customdata,
+                        hovertemplate=supply_hover,
+                        hoverlabel=dict(
+                            bgcolor="#ccccff",
+                            font_color=hover_font_color,
+                        ),
+                    ))
+                    
+                    # Line connecting OA to Supply Air (solid line for adiabatic process)
+                    fig.add_trace(go.Scatter(
+                        x=[oa_state[KEY_DB], supply_state[KEY_DB]],
+                        y=[hr_oa_adiabatic * y_scale, hr_supply_adiabatic * y_scale],
+                        mode='lines',
+                        name='Adiabatic Process',
+                        showlegend=False,
+                        line=dict(color='blue', width=2),
+                        hoverinfo='skip',
+                    ))
+            
+            # Standard Cycle Analysis plotting
+            else:
+                results_ra = st.session_state.get("cycle_ra")
+                results_oa = st.session_state.get("cycle_oa")
+                results_ma = st.session_state.get("cycle_ma")
+                cycle_points = st.session_state.get("cycle_points", [])
+                pct_oa = st.session_state.get("cycle_pct_oa", 20.0)
+                template_plot = st.session_state.get("cycle_template", "Custom")
+                
+                # For Recirculating CRAH, always show RA -> cycle points (no OA, no MA mixing)
+                if template_plot == "Recirculating CRAH" and results_ra is not None:
                     pts_x = [results_ra[KEY_DB]]
-                    pts_y = [hr_ra]
+                    pts_y = [results_ra[KEY_HR] * y_scale]
                     for pt in cycle_points:
                         pts_x.append(pt["state"][KEY_DB])
                         pts_y.append(pt["state"][KEY_HR] * y_scale)
                     if len(pts_x) > 1:
                         fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
                     fig.add_trace(go.Scatter(
-                        x=[results_ra[KEY_DB]], y=[hr_ra],
+                        x=[results_ra[KEY_DB]], y=[results_ra[KEY_HR] * y_scale],
                         mode='markers+text', text=['Return Air'], textposition='top center',
                         marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
                     ))
-                else:
-                    # Mixed: show RA, OA, MA and mixing lines
-                    fig.add_trace(go.Scatter(
-                        x=[results_oa[KEY_DB], results_ma[KEY_DB]], y=[hr_oa, hr_ma],
-                        mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=[results_ra[KEY_DB], results_ma[KEY_DB]], y=[hr_ra, hr_ma],
-                        mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
-                    ))
-                    pts_x = [results_ma[KEY_DB]]
-                    pts_y = [hr_ma]
-                    for pt in cycle_points:
-                        pts_x.append(pt["state"][KEY_DB])
-                        pts_y.append(pt["state"][KEY_HR] * y_scale)
-                    if len(pts_x) > 1:
-                        fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
-                    fig.add_trace(go.Scatter(
-                        x=[results_ra[KEY_DB]], y=[hr_ra],
-                        mode='markers+text', text=['Return'], textposition='top center',
-                        marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=[results_oa[KEY_DB]], y=[hr_oa],
-                        mode='markers+text', text=['Outside'], textposition='top center',
-                        marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=[results_ma[KEY_DB]], y=[hr_ma],
-                        mode='markers+text', text=['Mixed Air'], textposition='top center',
-                        marker=dict(size=12, color='orange', symbol='diamond'), showlegend=False, hoverinfo='skip',
-                    ))
-                for i, pt in enumerate(cycle_points):
-                    fig.add_trace(go.Scatter(
-                        x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
-                        mode='markers+text', text=[pt["name"]], textposition='top center',
-                        marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
-                    ))
-                def _arrow(ax, ay, x, y):
-                    cycle_arrow_annotations.append(dict(
-                        x=x, y=y, ax=ax, ay=ay,
-                        xref="x", yref="y", axref="x", ayref="y",
-                        showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
-                    ))
-                if pct_oa >= 99.5:
-                    pts_x = [results_oa[KEY_DB]]
-                    pts_y = [hr_oa]
-                    for pt in cycle_points:
-                        pts_x.append(pt["state"][KEY_DB])
-                        pts_y.append(pt["state"][KEY_HR] * y_scale)
+                    # Plot cycle point markers
+                    for i, pt in enumerate(cycle_points):
+                        fig.add_trace(go.Scatter(
+                            x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
+                            mode='markers+text', text=[pt["name"]], textposition='top center',
+                            marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
+                        ))
+                    # Add arrows for Recirculating CRAH
                     for i in range(len(pts_x) - 1):
-                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
-                elif pct_oa <= 0.5:
-                    pts_x = [results_ra[KEY_DB]]
-                    pts_y = [hr_ra]
-                    for pt in cycle_points:
-                        pts_x.append(pt["state"][KEY_DB])
-                        pts_y.append(pt["state"][KEY_HR] * y_scale)
-                    for i in range(len(pts_x) - 1):
-                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
-                else:
-                    _arrow(results_oa[KEY_DB], hr_oa, results_ma[KEY_DB], hr_ma)
-                    _arrow(results_ra[KEY_DB], hr_ra, results_ma[KEY_DB], hr_ma)
-                    for i in range(len(pts_x) - 1):
-                        _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+                        cycle_arrow_annotations.append(dict(
+                            x=pts_x[i + 1], y=pts_y[i + 1], ax=pts_x[i], ay=pts_y[i],
+                            xref="x", yref="y", axref="x", ayref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
+                        ))
+                elif results_ma is not None:
+                    hr_ra = (results_ra[KEY_HR] * y_scale) if results_ra is not None else None
+                    hr_oa = (results_oa[KEY_HR] * y_scale) if results_oa is not None else None
+                    hr_ma = results_ma[KEY_HR] * y_scale
+                    # 100% OA: only OA visible; OA is the start of the chain. 0% OA: only RA visible; RA is the start.
+                    if pct_oa >= 99.5:
+                        pts_x = [results_oa[KEY_DB]]
+                        pts_y = [hr_oa]
+                        for pt in cycle_points:
+                            pts_x.append(pt["state"][KEY_DB])
+                            pts_y.append(pt["state"][KEY_HR] * y_scale)
+                        if len(pts_x) > 1:
+                            fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                        fig.add_trace(go.Scatter(
+                            x=[results_oa[KEY_DB]], y=[hr_oa],
+                            mode='markers+text', text=['Outside Air'], textposition='top center',
+                            marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                        ))
+                    elif pct_oa <= 0.5:
+                        pts_x = [results_ra[KEY_DB]]
+                        pts_y = [hr_ra]
+                        for pt in cycle_points:
+                            pts_x.append(pt["state"][KEY_DB])
+                            pts_y.append(pt["state"][KEY_HR] * y_scale)
+                        if len(pts_x) > 1:
+                            fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                        fig.add_trace(go.Scatter(
+                            x=[results_ra[KEY_DB]], y=[hr_ra],
+                            mode='markers+text', text=['Return Air'], textposition='top center',
+                            marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                        ))
+                    else:
+                        # Mixed: show RA, OA, MA and mixing lines
+                        fig.add_trace(go.Scatter(
+                            x=[results_oa[KEY_DB], results_ma[KEY_DB]], y=[hr_oa, hr_ma],
+                            mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=[results_ra[KEY_DB], results_ma[KEY_DB]], y=[hr_ra, hr_ma],
+                            mode='lines', line=dict(color='gray', width=2, dash='dash'), showlegend=False, hoverinfo='skip',
+                        ))
+                        pts_x = [results_ma[KEY_DB]]
+                        pts_y = [hr_ma]
+                        for pt in cycle_points:
+                            pts_x.append(pt["state"][KEY_DB])
+                            pts_y.append(pt["state"][KEY_HR] * y_scale)
+                        if len(pts_x) > 1:
+                            fig.add_trace(go.Scatter(x=pts_x, y=pts_y, mode='lines', line=dict(color='#333', width=2), showlegend=False, hoverinfo='skip'))
+                        fig.add_trace(go.Scatter(
+                            x=[results_ra[KEY_DB]], y=[hr_ra],
+                            mode='markers+text', text=['Return'], textposition='top center',
+                            marker=dict(size=12, color='blue', symbol='circle'), showlegend=False, hoverinfo='skip',
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=[results_oa[KEY_DB]], y=[hr_oa],
+                            mode='markers+text', text=['Outside'], textposition='top center',
+                            marker=dict(size=12, color='green', symbol='square'), showlegend=False, hoverinfo='skip',
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=[results_ma[KEY_DB]], y=[hr_ma],
+                            mode='markers+text', text=['Mixed Air'], textposition='top center',
+                            marker=dict(size=12, color='orange', symbol='diamond'), showlegend=False, hoverinfo='skip',
+                        ))
+                    for i, pt in enumerate(cycle_points):
+                        fig.add_trace(go.Scatter(
+                            x=[pt["state"][KEY_DB]], y=[pt["state"][KEY_HR] * y_scale],
+                            mode='markers+text', text=[pt["name"]], textposition='top center',
+                            marker=dict(size=10, color='purple', symbol='diamond-open'), showlegend=False, hoverinfo='skip',
+                        ))
+                    def _arrow(ax, ay, x, y):
+                        cycle_arrow_annotations.append(dict(
+                            x=x, y=y, ax=ax, ay=ay,
+                            xref="x", yref="y", axref="x", ayref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1.2, arrowwidth=1.5,
+                        ))
+                    if pct_oa >= 99.5:
+                        pts_x = [results_oa[KEY_DB]]
+                        pts_y = [hr_oa]
+                        for pt in cycle_points:
+                            pts_x.append(pt["state"][KEY_DB])
+                            pts_y.append(pt["state"][KEY_HR] * y_scale)
+                        for i in range(len(pts_x) - 1):
+                            _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+                    elif pct_oa <= 0.5:
+                        pts_x = [results_ra[KEY_DB]]
+                        pts_y = [hr_ra]
+                        for pt in cycle_points:
+                            pts_x.append(pt["state"][KEY_DB])
+                            pts_y.append(pt["state"][KEY_HR] * y_scale)
+                        for i in range(len(pts_x) - 1):
+                            _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
+                    else:
+                        _arrow(results_oa[KEY_DB], hr_oa, results_ma[KEY_DB], hr_ma)
+                        _arrow(results_ra[KEY_DB], hr_ra, results_ma[KEY_DB], hr_ma)
+                        for i in range(len(pts_x) - 1):
+                            _arrow(pts_x[i], pts_y[i], pts_x[i + 1], pts_y[i + 1])
     
         # Add hover grid trace LAST (after all state points) so it's on top and receives hover everywhere
         # Critical: opacity must be > 0 for Plotly to register hover events; using 0.05 for reliability
@@ -2426,51 +3385,68 @@ with col2:
             results_oa_t = st.session_state.get("cycle_oa")
             results_ma_t = st.session_state.get("cycle_ma")
             cycle_points_t = st.session_state.get("cycle_points", [])
-            if results_ra_t is not None and results_oa_t is not None and results_ma_t is not None:
-                # Mass flow: actual volumetric airflow x actual moist-air density at MA (altitude, T, humidity).
-                # Energy: actual delta-enthalpy (PsychroLib) x actual mass flow — not 1.08*CFM*dT or similar.
-                # Condensate: actual mass flow x |delta humidity ratio|.
-                total_airflow = st.session_state.get("cycle_total_airflow", 10000.0 if not USE_SI else 5000.0)
-                if USE_SI:
-                    mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS] / 3600.0  # kg/s
-                else:
-                    mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS]  # lb/min
-    
-                # Column headers with units; energy/condensate columns follow global IP/SI toggle
+            template_t = st.session_state.get("cycle_template", "Custom")
+            adiabatic_oa_t = st.session_state.get("adiabatic_oa_state")
+            adiabatic_supply_t = st.session_state.get("adiabatic_supply_state")
+            
+            # Adiabatic Cooling: table = OA + Supply Air only
+            if template_t == "Adiabatic Cooling":
+                show_table = adiabatic_oa_t is not None and adiabatic_supply_t is not None
+            elif template_t == "Recirculating CRAH":
+                show_table = results_ra_t is not None and results_ma_t is not None
+            else:
+                show_table = results_ra_t is not None and results_oa_t is not None and results_ma_t is not None
+            
+            if show_table:
                 base_cols = ["Point Name", f"DB ({TEMP_LABEL})", f"WB ({TEMP_LABEL})", "RH (%)", f"Enthalpy ({ENTHALPY_LABEL})", f"Dew Point ({TEMP_LABEL})"]
-                if USE_SI:
-                    cols = base_cols + ["Energy (kW)", "Condensate (L/min)"]
+                empty_extra = ("", "")
+                
+                if template_t == "Adiabatic Cooling":
+                    cols = base_cols
+                    rows = [
+                        ("Outside Air", adiabatic_oa_t[KEY_DB], adiabatic_oa_t[KEY_WB], adiabatic_oa_t[KEY_RH], adiabatic_oa_t[KEY_ENTH], adiabatic_oa_t[KEY_DP]),
+                        ("Supply Air", adiabatic_supply_t[KEY_DB], adiabatic_supply_t[KEY_WB], adiabatic_supply_t[KEY_RH], adiabatic_supply_t[KEY_ENTH], adiabatic_supply_t[KEY_DP]),
+                    ]
                 else:
-                    cols = base_cols + ["Energy (BTU/hr)", "Condensate (GPM)"]
-                empty_extra = ("", "")  # for RA, OA, MA rows
-                rows = [
-                    ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]) + empty_extra,
-                    ("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]) + empty_extra,
-                    ("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]) + empty_extra,
-                ]
-                for i, pt in enumerate(cycle_points_t):
-                    s = pt["state"]
-                    prev = results_ma_t if i == 0 else cycle_points_t[i - 1]["state"]
-                    delta_h = s[KEY_ENTH] - prev[KEY_ENTH]
-                    delta_hr = s[KEY_HR] - prev[KEY_HR]
+                    # Mass flow for non-adiabatic templates
+                    total_airflow = st.session_state.get("cycle_total_airflow", 10000.0 if not USE_SI else 5000.0)
                     if USE_SI:
-                        thermal_W = delta_h * mass_flow_cycle
-                        thermal_kw = thermal_W / 1000.0
-                        en_str = f"{thermal_kw:.2f}"
+                        mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS] / 3600.0  # kg/s
                     else:
-                        thermal_btuh = delta_h * mass_flow_cycle * 60.0
-                        en_str = f"{thermal_btuh:.0f}"
-                    if delta_hr < 0:
-                        water_removal = mass_flow_cycle * abs(delta_hr)
+                        mass_flow_cycle = total_airflow * results_ma_t[KEY_DENS]  # lb/min
+                    if USE_SI:
+                        cols = base_cols + ["Energy (kW)", "Condensate (L/min)"]
+                    else:
+                        cols = base_cols + ["Energy (BTU/hr)", "Condensate (GPM)"]
+                    rows = [
+                        ("Return", results_ra_t[KEY_DB], results_ra_t[KEY_WB], results_ra_t[KEY_RH], results_ra_t[KEY_ENTH], results_ra_t[KEY_DP]) + empty_extra,
+                    ]
+                    if template_t != "Recirculating CRAH":
+                        rows.append(("Outside", results_oa_t[KEY_DB], results_oa_t[KEY_WB], results_oa_t[KEY_RH], results_oa_t[KEY_ENTH], results_oa_t[KEY_DP]) + empty_extra)
+                        rows.append(("Mixed", results_ma_t[KEY_DB], results_ma_t[KEY_WB], results_ma_t[KEY_RH], results_ma_t[KEY_ENTH], results_ma_t[KEY_DP]) + empty_extra)
+                    for i, pt in enumerate(cycle_points_t):
+                        s = pt["state"]
+                        prev = results_ma_t if i == 0 else cycle_points_t[i - 1]["state"]
+                        delta_h = s[KEY_ENTH] - prev[KEY_ENTH]
+                        delta_hr = s[KEY_HR] - prev[KEY_HR]
                         if USE_SI:
-                            lpm = water_removal * 60.0
-                            cond_str = f"{lpm:.3f}"
+                            thermal_W = delta_h * mass_flow_cycle
+                            thermal_kw = thermal_W / 1000.0
+                            en_str = f"{thermal_kw:.2f}"
                         else:
-                            gpm = water_removal / 8.34
-                            cond_str = f"{gpm:.3f}"
-                    else:
-                        cond_str = ""
-                    rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP], en_str, cond_str))
+                            thermal_btuh = delta_h * mass_flow_cycle * 60.0
+                            en_str = f"{thermal_btuh:.0f}"
+                        if delta_hr < 0:
+                            water_removal = mass_flow_cycle * abs(delta_hr)
+                            if USE_SI:
+                                lpm = water_removal * 60.0
+                                cond_str = f"{lpm:.3f}"
+                            else:
+                                gpm = water_removal / 8.34
+                                cond_str = f"{gpm:.3f}"
+                        else:
+                            cond_str = ""
+                        rows.append((pt["name"], s[KEY_DB], s[KEY_WB], s[KEY_RH], s[KEY_ENTH], s[KEY_DP], en_str, cond_str))
                 st.subheader("Cycle Data")
                 df_cycle = pd.DataFrame(rows, columns=cols)
                 st.markdown(
@@ -2482,7 +3458,7 @@ with col2:
                     unsafe_allow_html=True,
                 )
                 st.dataframe(df_cycle, use_container_width=True, hide_index=True)
-                if len(cycle_points_t) > 0:
+                if template_t != "Adiabatic Cooling" and len(cycle_points_t) > 0:
                     st.caption("To remove a user-added point, select it below and click Remove.")
                     rm_col1, rm_col2 = st.columns([2, 1])
                     with rm_col1:
@@ -2543,6 +3519,64 @@ with col2:
                     min_value=new_chart_t_min + 5.0,
                     max_value=150.0,
                 )
+            # Weather Heatmap: directly below chart limits to avoid large gap
+            st.markdown("**Weather Heatmap**")
+            show_weather_heatmap = st.checkbox("Show Weather Heatmap", value=st.session_state.get("show_weather_heatmap", False), key="show_weather_heatmap")
+            weather_data = None
+            if show_weather_heatmap:
+                weather_files = get_weather_files()
+                if len(weather_files) == 0:
+                    st.warning("No .epw files found in 'weather_data' folder.")
+                else:
+                    selected_file = st.selectbox(
+                        "Select Weather File",
+                        options=weather_files,
+                        index=0,
+                        key="weather_file_select"
+                    )
+                    heatmap_opacity = st.slider(
+                        "Heatmap Opacity",
+                        min_value=0.1,
+                        max_value=1.0,
+                        value=st.session_state.get("heatmap_opacity", 0.6),
+                        step=0.1,
+                        key="heatmap_opacity"
+                    )
+                    if selected_file:
+                        weather_data = load_epw_data(selected_file)
+                        if len(weather_data) == 0:
+                            st.error(f"Failed to load weather data from {selected_file}")
+                        else:
+                            st.session_state["weather_data"] = weather_data
+                            st.session_state["weather_file"] = selected_file
+            else:
+                if "weather_data" in st.session_state:
+                    del st.session_state["weather_data"]
+                if "weather_file" in st.session_state:
+                    del st.session_state["weather_file"]
+            # Envelope Overlays
+            st.markdown("**Envelope Overlays**")
+            envelope_options = ["None", "TC 9.9 Recommended", "TC 9.9 Allowable A1", "ASHRAE 55 Summer", "ASHRAE 55 Winter", "Custom"]
+            if "show_envelopes" not in st.session_state:
+                st.session_state["show_envelopes"] = []
+            show_envelopes = st.multiselect(
+                "Show Envelopes",
+                options=envelope_options,
+                default=st.session_state.get("show_envelopes", []),
+                key="show_envelopes",
+            )
+            if "Custom" in show_envelopes:
+                st.caption("Custom envelope: set DB range and either RH or DP range.")
+                c_db_min = st.number_input("Min Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 64.0)), step=0.5, key="envelope_custom_db_min")
+                c_db_max = st.number_input("Max Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 80.0)), step=0.5, key="envelope_custom_db_max")
+                envelope_custom_moisture_type = st.radio("Moisture limit by", ["Relative Humidity (%)", "Dew Point (" + ("°C" if USE_SI else "°F") + ")"], index=0, key="envelope_custom_moisture_type", horizontal=True)
+                st.session_state["envelope_custom_use_rh"] = ("Relative Humidity" in envelope_custom_moisture_type)
+                if st.session_state["envelope_custom_use_rh"]:
+                    st.number_input("Min RH (%)", value=float(st.session_state.get("envelope_custom_rh_min", 20.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_min")
+                    st.number_input("Max RH (%)", value=float(st.session_state.get("envelope_custom_rh_max", 60.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_max")
+                else:
+                    st.number_input("Min Dew Point (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_dp_min", 5.0 if USE_SI else 41.0)), step=0.5, key="envelope_custom_dp_min")
+                    st.number_input("Max Dew Point (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_dp_max", 15.0 if USE_SI else 59.0)), step=0.5, key="envelope_custom_dp_max")
     
         with altitude_col:
             if USE_SI:
@@ -2586,7 +3620,7 @@ with col2:
             st.checkbox("Dew Point", value=st.session_state.get("show_dp_lines", False), key="show_dp_lines")
             st.checkbox("Enthalpy", value=st.session_state.get("show_enthalpy_lines", True), key="show_enthalpy_lines")
             st.checkbox("HR Grid", value=st.session_state.get("show_hr_lines", True), key="show_hr_lines")
-    
+        
 # Full-width section: Process mode - Point 1 | Point 2 | Process Summary
 if st.session_state.get("mode") == "Process":
     r1 = st.session_state.get("results_1")
