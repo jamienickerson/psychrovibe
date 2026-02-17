@@ -2006,9 +2006,16 @@ with col2:
         if st.session_state.get("show_weather_heatmap", False) and "weather_data" in st.session_state:
             weather_data_list = st.session_state.get("weather_data", [])
             if len(weather_data_list) > 0:
-                # Extract dry bulb and humidity ratio arrays
-                db_array = np.array([d[0] for d in weather_data_list])
-                hr_array_raw = np.array([d[1] for d in weather_data_list])
+                # Shift down points above saturation: keep DB, cap HR at saturation so bins stay valid
+                corrected_list = []
+                for db, hr in weather_data_list:
+                    sat_hr_at_db = get_sat_hr(db, sat_lookup, P)
+                    if sat_hr_at_db is not None and hr > sat_hr_at_db:
+                        hr = sat_hr_at_db
+                    corrected_list.append((db, hr))
+                # Extract dry bulb and humidity ratio arrays from corrected data
+                db_array = np.array([d[0] for d in corrected_list])
+                hr_array_raw = np.array([d[1] for d in corrected_list])
                 
                 # Scale humidity ratios for y-axis (same scaling as other traces)
                 hr_array = hr_array_raw * y_scale
@@ -2554,7 +2561,7 @@ with col2:
                 ))
     
         # 7. Plot Saturation Curve (100% RH) on top of minor lines
-        sat_hr_scaled = [min(hr, max_hr) * y_scale if hr is not None else None for hr in sat_hr]
+        sat_hr_scaled = [(min(hr, max_hr) * y_scale) if hr is not None else None for hr in sat_hr]
         fig.add_trace(go.Scatter(
             x=sat_temps,
             y=sat_hr_scaled,
