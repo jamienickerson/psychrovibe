@@ -2098,19 +2098,21 @@ with col2:
                 if env_name == "Custom":
                     # Build Custom polygon from session state; all psychrolib in SI
                     try:
-                        db_lo = st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 64.0)
-                        db_hi = st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 80.0)
+                        db_lo = st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 50.0)
+                        db_hi = st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 95.0)
                         if not USE_SI:
                             db_lo, db_hi = f_to_c(db_lo), f_to_c(db_hi)
                         use_rh = st.session_state.get("envelope_custom_use_rh", True)
                         psychrolib.SetUnitSystem(psychrolib.SI)
                         if use_rh:
-                            rh_lo = st.session_state.get("envelope_custom_rh_min", 20.0) / 100.0
-                            rh_hi = st.session_state.get("envelope_custom_rh_max", 60.0) / 100.0
-                            w_ll = psychrolib.GetHumRatioFromRelHum(db_lo, rh_lo, P_pa)
-                            w_lh = psychrolib.GetHumRatioFromRelHum(db_lo, rh_hi, P_pa)
-                            w_hl = psychrolib.GetHumRatioFromRelHum(db_hi, rh_lo, P_pa)
-                            w_hh = psychrolib.GetHumRatioFromRelHum(db_hi, rh_hi, P_pa)
+                            rh_lo = st.session_state.get("envelope_custom_rh_min", 5.0) / 100.0
+                            rh_hi = st.session_state.get("envelope_custom_rh_max", 80.0) / 100.0
+                            # Follow constant-RH curves: sample along min-RH and max-RH between db_lo and db_hi
+                            num_pts = 40
+                            db_vals = [db_lo + (db_hi - db_lo) * i / max(1, num_pts - 1) for i in range(num_pts)]
+                            bottom_curve = [(db, psychrolib.GetHumRatioFromRelHum(db, rh_lo, P_pa)) for db in db_vals]
+                            top_curve = [(db, psychrolib.GetHumRatioFromRelHum(db, rh_hi, P_pa)) for db in reversed(db_vals)]
+                            pts_si = bottom_curve + top_curve + [bottom_curve[0]]
                         else:
                             dp_lo = st.session_state.get("envelope_custom_dp_min", 5.0)
                             dp_hi = st.session_state.get("envelope_custom_dp_max", 15.0)
@@ -2119,7 +2121,7 @@ with col2:
                             w_ll = psychrolib.GetHumRatioFromTDewPoint(dp_lo, P_pa)
                             w_lh = psychrolib.GetHumRatioFromTDewPoint(dp_hi, P_pa)
                             w_hl, w_hh = w_ll, w_lh
-                        pts_si = [(db_lo, w_ll), (db_hi, w_hl), (db_hi, w_hh), (db_lo, w_lh), (db_lo, w_ll)]
+                            pts_si = [(db_lo, w_ll), (db_hi, w_hl), (db_hi, w_hh), (db_lo, w_lh), (db_lo, w_ll)]
                         psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
                     except Exception:
                         try:
@@ -3567,13 +3569,13 @@ with col2:
             )
             if "Custom" in show_envelopes:
                 st.caption("Custom envelope: set DB range and either RH or DP range.")
-                c_db_min = st.number_input("Min Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 64.0)), step=0.5, key="envelope_custom_db_min")
-                c_db_max = st.number_input("Max Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 80.0)), step=0.5, key="envelope_custom_db_max")
+                c_db_min = st.number_input("Min Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_min", 18.0 if USE_SI else 50.0)), step=0.5, key="envelope_custom_db_min")
+                c_db_max = st.number_input("Max Dry Bulb (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_db_max", 27.0 if USE_SI else 95.0)), step=0.5, key="envelope_custom_db_max")
                 envelope_custom_moisture_type = st.radio("Moisture limit by", ["Relative Humidity (%)", "Dew Point (" + ("°C" if USE_SI else "°F") + ")"], index=0, key="envelope_custom_moisture_type", horizontal=True)
                 st.session_state["envelope_custom_use_rh"] = ("Relative Humidity" in envelope_custom_moisture_type)
                 if st.session_state["envelope_custom_use_rh"]:
-                    st.number_input("Min RH (%)", value=float(st.session_state.get("envelope_custom_rh_min", 20.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_min")
-                    st.number_input("Max RH (%)", value=float(st.session_state.get("envelope_custom_rh_max", 60.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_max")
+                    st.number_input("Min RH (%)", value=float(st.session_state.get("envelope_custom_rh_min", 5.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_min")
+                    st.number_input("Max RH (%)", value=float(st.session_state.get("envelope_custom_rh_max", 80.0)), step=1.0, min_value=0.0, max_value=100.0, key="envelope_custom_rh_max")
                 else:
                     st.number_input("Min Dew Point (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_dp_min", 5.0 if USE_SI else 41.0)), step=0.5, key="envelope_custom_dp_min")
                     st.number_input("Max Dew Point (" + ("°C" if USE_SI else "°F") + ")", value=float(st.session_state.get("envelope_custom_dp_max", 15.0 if USE_SI else 59.0)), step=0.5, key="envelope_custom_dp_max")
