@@ -249,7 +249,7 @@ chart_t_max = st.session_state.get("chart_t_max", DEFAULT_CHART_MAX_F)
 altitude_ft = st.session_state.get("altitude_ft", 0.0)
 
 # Clamp chart limits (°F) to reasonable range
-chart_t_min = max(-20.0, min(chart_t_min, 150.0))
+chart_t_min = max(-30.0, min(chart_t_min, 150.0))
 chart_t_max = max(chart_t_min + 5.0, min(chart_t_max, 150.0))
 
 # Pressure: PsychroLib expects altitude in m (SI) or ft (IP)
@@ -629,7 +629,7 @@ def find_state_on_enthalpy_at_db(enthalpy, target_db, pressure, t_min, t_max):
 def get_weather_files():
     """
     Look for a folder named 'weather_data' in the current directory.
-    Return a list of all filenames ending in .epw found in that folder.
+    Return a list of all filenames ending in .epw or .csv (Hands Down format) found in that folder.
     If the folder does not exist or is empty, return an empty list (do not crash).
     """
     try:
@@ -637,27 +637,28 @@ def get_weather_files():
         if not weather_dir.exists() or not weather_dir.is_dir():
             return []
         epw_files = list(weather_dir.glob("*.epw"))
-        return sorted([f.name for f in epw_files])
+        csv_files = list(weather_dir.glob("*.csv"))
+        return sorted([f.name for f in epw_files + csv_files])
     except Exception:
         return []
 
 
 def load_epw_data(filename):
     """
-    Load EPW weather file and calculate humidity ratios.
+    Load weather data from an EPW file or a Hands Down CSV file.
+    Returns list of (dry_bulb, humidity_ratio) in the app's current unit system.
     
     EPW Format:
     - No headers (skip first 8 rows)
     - Column 6: Dry Bulb Temperature (°C)
     - Column 7: Dew Point Temperature (°C)
     - Column 9: Atmospheric Pressure (Pa)
+    EPW files are ALWAYS in SI units. Psychrolib is set to SI for calculation, then output is converted if app is IP.
     
-    EPW files are ALWAYS in SI units (Celsius, Pascals).
-    This function forces psychrolib to SI mode during calculation to match the input format,
-    then restores the original unit system and converts output if needed.
-    
-    Returns:
-    - List of tuples: (dry_bulb, humidity_ratio) in the app's current unit system
+    CSV Format (Hands Down Software):
+    - Headers on row 5 (header=4)
+    - Columns: "Dry Bulb" (°F), "Humidity Ratio" (lb/lb)
+    - Source is always °F and lb/lb; convert to °C only when app is in SI mode.
     """
     try:
         weather_dir = Path("weather_data")
@@ -665,29 +666,34 @@ def load_epw_data(filename):
         if not filepath.exists():
             return []
         
-        # Store the app's current unit system setting BEFORE forcing SI
-        # The app sets psychrolib.SetUnitSystem based on USE_SI at startup, so they should match
-        # We'll restore based on USE_SI after calculations
-        app_use_si = USE_SI
+        suffix = filepath.suffix.lower()
         
-        # Read EPW file (no headers, comma-delimited)
-        # EPW files are comma-delimited; try comma first, fall back to whitespace
+        # --- Hands Down CSV: headers on row 5, columns "Dry Bulb" and "Humidity Ratio" (°F, lb/lb) ---
+        if suffix == ".csv":
+            df = pd.read_csv(filepath, header=4)
+            if "Dry Bulb" not in df.columns or "Humidity Ratio" not in df.columns:
+                return []
+            dry_bulb = df["Dry Bulb"].astype(float)
+            hr = df["Humidity Ratio"].astype(float)
+            valid = ~(pd.isna(dry_bulb) | pd.isna(hr))
+            dry_bulb = dry_bulb[valid].values
+            hr = hr[valid].values
+            if USE_SI:
+                dry_bulb = (dry_bulb - 32.0) * 5.0 / 9.0  # °F -> °C
+            return list(zip(dry_bulb.tolist(), hr.tolist()))
+        
+        # --- EPW: EnergyPlus format, SI units, compute W from dew point ---
+        app_use_si = USE_SI
         try:
-            df = pd.read_csv(filepath, header=None, skiprows=8, sep=',')  # Skip 8 header rows, comma-delimited
+            df = pd.read_csv(filepath, header=None, skiprows=8, sep=',')
         except Exception:
-            # Fallback to whitespace delimiter
             df = pd.read_csv(filepath, header=None, skiprows=8, delim_whitespace=True)
         
-        # Extract columns (0-indexed: column 6 = index 6, column 7 = index 7, column 9 = index 9)
-        dry_bulb_c = df.iloc[:, 6].astype(float).values  # Column 6: Dry Bulb (°C)
-        dew_point_c = df.iloc[:, 7].astype(float).values  # Column 7: Dew Point (°C)
-        pressure_pa = df.iloc[:, 9].astype(float).values  # Column 9: Pressure (Pa)
+        dry_bulb_c = df.iloc[:, 6].astype(float).values
+        dew_point_c = df.iloc[:, 7].astype(float).values
+        pressure_pa = df.iloc[:, 9].astype(float).values
         
-        # FORCE psychrolib to SI mode for all calculations
-        # EPW data is always SI, so psychrolib must be SI to interpret inputs correctly
         psychrolib.SetUnitSystem(psychrolib.SI)
-        
-        # Calculate humidity ratio for each hour using psychrolib (now in SI mode)
         humidity_ratios_si = []
         dry_bulbs_si = []
         
@@ -696,48 +702,29 @@ def load_epw_data(filename):
                 db_c = dry_bulb_c[i]
                 dp_c = dew_point_c[i]
                 p_pa = pressure_pa[i]
-                
-                # Skip invalid data
                 if pd.isna(db_c) or pd.isna(dp_c) or pd.isna(p_pa) or p_pa <= 0:
                     continue
-                
-                # Calculate humidity ratio from dew point
-                # Inputs: dp_c (°C), p_pa (Pa) - both SI
-                # Returns: hr_kg_kg (kg/kg) - SI units
                 hr_kg_kg = psychrolib.GetHumRatioFromTDewPoint(dp_c, p_pa)
-                
-                # Store SI values (we'll convert later if needed)
                 dry_bulbs_si.append(db_c)
                 humidity_ratios_si.append(hr_kg_kg)
             except Exception:
                 continue
         
-        # RESTORE the original psychrolib unit system immediately after calculations
         psychrolib.SetUnitSystem(psychrolib.SI if app_use_si else psychrolib.IP)
-        
-        # Convert output based on app's unit system setting (for display)
         dry_bulbs = []
         humidity_ratios = []
-        
         if app_use_si:
-            # App is in SI mode: return as-is (°C and kg/kg)
             dry_bulbs = dry_bulbs_si
             humidity_ratios = humidity_ratios_si
         else:
-            # App is in IP mode: convert Dry Bulb from °C to °F
-            # Note: Humidity Ratio (kg/kg) = (lb/lb) - it's dimensionless, same numeric value
             for db_c, hr_kg_kg in zip(dry_bulbs_si, humidity_ratios_si):
-                db_f = c_to_f(db_c)
-                dry_bulbs.append(db_f)
-                humidity_ratios.append(hr_kg_kg)  # kg/kg = lb/lb (no conversion needed)
-        
+                dry_bulbs.append(c_to_f(db_c))
+                humidity_ratios.append(hr_kg_kg)
         return list(zip(dry_bulbs, humidity_ratios))
-    except Exception as e:
-        # Ensure we restore psychrolib unit system even if an error occurs
-        # Use the global USE_SI to restore (should match what was set before)
+    except Exception:
         try:
             psychrolib.SetUnitSystem(psychrolib.SI if USE_SI else psychrolib.IP)
-        except:
+        except Exception:
             pass
         return []
 
@@ -3510,7 +3497,7 @@ with col2:
                     key="chart_t_min",
                     value=chart_t_min,
                     step=1.0,
-                    min_value=-20.0,
+                    min_value=-30.0,
                     max_value=150.0,
                 )
                 new_chart_t_max = st.number_input(
@@ -3528,7 +3515,7 @@ with col2:
             if show_weather_heatmap:
                 weather_files = get_weather_files()
                 if len(weather_files) == 0:
-                    st.warning("No .epw files found in 'weather_data' folder.")
+                    st.warning("No .epw or .csv files found in 'weather_data' folder.")
                 else:
                     selected_file = st.selectbox(
                         "Select Weather File",
